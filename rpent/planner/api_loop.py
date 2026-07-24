@@ -13,6 +13,7 @@ import base64
 import dataclasses
 import json
 import queue
+from pathlib import Path
 from typing import Any
 
 from pydantic_ai import Agent, BinaryContent, ModelSettings, Tool, ToolReturn
@@ -400,12 +401,63 @@ def _build_tools(toolkit: Toolkit, *, no_images: bool = False) -> list[Tool]:
     return tools
 
 
-def read_image(path: str) -> ToolReturn:
-    """Read a local image path returned by an RPent tool as visual input."""
+def read_image(path: str) -> ToolReturn | str:
+    """Read a local image path returned by an RPent tool as visual input.
+
+    OpenAI-compatible models occasionally rewrite a returned path such as
+    ``images_wrist/frame.png`` as ``images/wrist/frame.png``.  Correct that
+    common directory split before reading.  A genuinely missing file is
+    reported as a normal tool result so the model can retry instead of
+    terminating the whole agent loop with ``FileNotFoundError``.
+    """
+    requested = Path(path).expanduser()
+    resolved, alternatives = _resolve_image_path(requested)
+    if resolved is None:
+        available = (
+            "\nAvailable files with the same name:\n"
+            + "\n".join(f"- {candidate}" for candidate in alternatives)
+            if alternatives
+            else ""
+        )
+        return (
+            f"Image file not found: {requested}. Do not invent or rewrite image "
+            "paths; copy the exact absolute path returned by the most recent "
+            f"RPent tool result and call read_image again.{available}"
+        )
+
+    if resolved != requested:
+        logger.warning("corrected image path '%s' to '%s'", requested, resolved)
+
     return ToolReturn(
-        return_value=path,
-        content=[BinaryContent.from_path(path)],
+        return_value=str(resolved),
+        content=[BinaryContent.from_path(resolved)],
     )
+
+
+def _resolve_image_path(requested: Path) -> tuple[Path | None, list[Path]]:
+    """Resolve an image path and return nearby same-name files as hints."""
+    if requested.is_file():
+        return requested, []
+
+    alternatives: list[Path] = []
+    # RPent camera outputs use flattened directories such as ``images_wrist``
+    # and ``images_cam_hi``.  Models sometimes turn the underscore into a path
+    # separator.  Keep this correction deliberately limited to known output
+    # directory families.
+    if len(requested.parents) >= 3:
+        inner_dir = requested.parent
+        outer_dir = inner_dir.parent
+        run_dir = outer_dir.parent
+        if outer_dir.name in {"images", "depths", "world"}:
+            flattened = run_dir / f"{outer_dir.name}_{inner_dir.name}" / requested.name
+            if flattened.is_file():
+                return flattened, []
+
+            for candidate in sorted(run_dir.glob(f"*/{requested.name}")):
+                if candidate.is_file():
+                    alternatives.append(candidate)
+
+    return None, alternatives[:8]
 
 
 def read_image_text_only(path: str) -> str:

@@ -8,13 +8,26 @@ from rpent.utils.config import get_resources_dir
 from rpent.utils.logging import get_logger
 
 RESOURCES_HF_REPO = os.environ.get("RPENT_RESOURCES_HF_REPO", "RLinf/RPent-memory")
+RESOURCES_ABLATION_ENV = "RPENT_ABLATE_RESOURCES"
 
 logger = get_logger("resources")
 
 
+def resource_context_disabled() -> bool:
+    """Return whether this run intentionally excludes external resources."""
+    return os.environ.get(RESOURCES_ABLATION_ENV) == "1"
+
+
 def ensure_resources(env_name: str) -> Path:
-    """Sync the env's resources from HuggingFace each run; set HF_HUB_OFFLINE=1 to use the local copy only. Memory is optional."""
+    """Sync resources unless this is an offline or resource-ablation run."""
     resources_dir = get_resources_dir(env_name)
+
+    if resource_context_disabled():
+        logger.info(
+            "resource-ablation mode enabled via %s=1; skipping HuggingFace sync",
+            RESOURCES_ABLATION_ENV,
+        )
+        return resources_dir
 
     if os.environ.get("HF_HUB_OFFLINE") == "1":
         return resources_dir

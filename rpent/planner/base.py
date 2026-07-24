@@ -118,7 +118,8 @@ def build_planner(
             raise ValueError(
                 "the 'api' planner requires a model id; pass --model with a "
                 "provider prefix (e.g. 'anthropic:claude-opus-4-8', "
-                "'openai:gpt-5.5', 'openai-chat:glm-5.2')."
+                "'openai:gpt-5.5', 'openai-chat:glm-5.2', "
+                "'qwen-vl:Qwen3.5-9B')."
             )
 
         import inspect
@@ -127,6 +128,7 @@ def build_planner(
         from pydantic_ai.providers import infer_provider, infer_provider_class
 
         from rpent.planner.api_loop import ApiAgentLoop
+        from rpent.planner.qwen_vl import build_qwen_vl_model, is_qwen_vl_model
 
         def _provider_factory(provider_name: str):
             """Build the provider for ``provider_name``.
@@ -145,9 +147,10 @@ def build_planner(
                 kwargs["base_url"] = base_url
             return provider_cls(**kwargs)
 
-        api_model = infer_model(
-            model, provider_factory=_provider_factory
-        )
+        if is_qwen_vl_model(model):
+            api_model = build_qwen_vl_model(model, base_url=base_url)
+        else:
+            api_model = infer_model(model, provider_factory=_provider_factory)
         return ApiAgentLoop(
             model=api_model,
             max_tokens=max_tokens,

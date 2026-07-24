@@ -60,12 +60,19 @@ Pick the provider by prefixing ``--model``:
    # OpenAI-compatible chat (e.g. GLM 5.2, text-only)
    rpent --planner api --model openai-chat:glm-5.2 --no-images ...
 
+   # Local Qwen3.5 (OpenAI-compatible vLLM service, with image input)
+   rpent --planner api \
+     --model qwen-vl:Qwen3.5-9B \
+     --base-url http://127.0.0.1:8000/v1 ...
+
 Environment variables it reads (override with ``--base-url`` if
 needed):
 
 - ``anthropic:*`` → ``ANTHROPIC_BASE_URL`` / ``ANTHROPIC_API_KEY``
 - ``openai:*`` / ``openai-chat:*`` → ``OPENAI_BASE_URL`` /
   ``OPENAI_API_KEY``
+- ``qwen-vl:*`` → ``QWEN_VL_BASE_URL`` / ``QWEN_VL_API_KEY``.
+  The key defaults to ``EMPTY`` for an unauthenticated local server.
 
 Useful ``api``-only knobs:
 
@@ -173,3 +180,69 @@ Two knobs bound every planner run:
 
 Both caps trigger a graceful ``finish(stuck)`` outcome rather than a
 hard crash, so you can tune them without losing the transcript.
+
+Local Qwen3.5 service
+---------------------
+
+The ``qwen-vl:`` provider connects to a local multimodal service through
+OpenAI Chat Completions. RPent camera frames are sent as base64
+``image_url`` blocks while the existing ``api`` planner continues to manage
+tool schemas and tool results. Do not pass ``--no-images`` with Qwen-VL.
+
+The client defaults match the existing 9B launcher:
+
+.. code-block:: bash
+
+   # Qwen/Qwen3.5-9B, served as Qwen3.5-9B on GPU 0 and port 8000
+   bash /home/dongyicheng/set_qwen9b.sh
+
+The smaller existing launcher uses a different served name and endpoint:
+
+.. code-block:: bash
+
+   # Qwen/Qwen3.5-4B, served as Qwen3.5-4B on GPU 3 and port 8001
+   bash /home/dongyicheng/set_qwen4b.sh
+   export QWEN_VL_MODEL=Qwen3.5-4B
+   export QWEN_VL_BASE_URL=http://127.0.0.1:8001/v1
+
+Before booting the simulator, validate model discovery, base64 image input,
+and parsed OpenAI tool calls:
+
+.. code-block:: bash
+
+   conda activate rpent
+   cd /home/dongyicheng/rpent
+   python scripts/qwen_vl/check_server.py \
+     --base-url http://127.0.0.1:8000/v1
+
+The existing launchers enable ``--reasoning-parser qwen3``,
+``--enable-auto-tool-choice``, and ``--tool-call-parser qwen3_coder``.
+Those flags are required: an ordinary image-chat endpoint works without them,
+but RPent cannot execute simulator tools unless vLLM returns structured
+``tool_calls``.
+
+Then launch RPent:
+
+.. code-block:: bash
+
+   export PI05_CHECKPOINT_PATH=/path/to/rlinf-pi05-libero-130-fullshot-sft
+   export CUDA_VISIBLE_DEVICES=<pi05-gpu>
+   export QWEN_VL_BASE_URL=http://127.0.0.1:8000/v1
+   export QWEN_VL_API_KEY=EMPTY
+
+   rpent --env libero \
+     --suite libero_object_swap --task 2 --seed 0 \
+     --planner api \
+     --model qwen-vl:Qwen3.5-9B \
+     --max-tokens 4096
+
+The 9B launcher exposes a 32K context window. The initial RPent prompt and
+tool schemas use about 8K tokens, so a per-reply cap of 4K leaves room for
+multi-turn tool results. Do not use ``--max-tokens 8192`` with the 16K 4B
+launcher: input plus the requested output budget can exceed its context limit.
+
+Qwen3.5 and Pi0.5 must fit in GPU memory at the same time. The current 9B
+launcher uses physical GPU 0; the 4B launcher uses physical GPU 3. Choose a
+different free GPU for Pi0.5 when possible. Both launchers bind vLLM to
+``0.0.0.0`` without an API key, so restrict ports 8000/8001 with a firewall
+if the host is reachable from an untrusted network.

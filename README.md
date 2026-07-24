@@ -124,6 +124,12 @@ rpent --env libero --suite libero_object_swap --task 2 --seed 0 \
 
 See the [planner docs](https://rpent.readthedocs.io/en/latest/rst_source/usage/configure_planner.html) to configure other planners (`api`, `codex`) and model providers.
 
+To replace the hosted planner with the existing multimodal Qwen3.5 service,
+start `/home/dongyicheng/set_qwen9b.sh`, run
+`scripts/qwen_vl/check_server.py`, then select
+`--planner api --model qwen-vl:Qwen3.5-9B`. The 4B/9B endpoint mapping and
+GPU notes are in the planner docs linked above.
+
 ### Interactive CLI mode
 
 Add `--interactive` (`-i`) to steer the agent live from your terminal. At the `you>` prompt, the built-in task is pre-filled — press Enter to use it or replace it with your own — then type any message while it runs to steer the agent at the next turn (`/help` lists commands; `/quit` or Ctrl-D ends). Requires an interactive terminal (TTY).

@@ -55,11 +55,18 @@ tool-calling 循环 *如何* 被编排, 以及能触达哪些 LLM / SDK 上有�
    # OpenAI 兼容 chat (例如 GLM 5.2, 纯文本)
    rpent --planner api --model openai-chat:glm-5.2 --no-images ...
 
+   # 本地 Qwen3.5 (OpenAI-compatible vLLM 服务, 保留图片输入)
+   rpent --planner api \
+     --model qwen-vl:Qwen3.5-9B \
+     --base-url http://127.0.0.1:8000/v1 ...
+
 它读取的环境变量 (需要覆盖时用 ``--base-url``):
 
 - ``anthropic:*`` → ``ANTHROPIC_BASE_URL`` / ``ANTHROPIC_API_KEY``
 - ``openai:*`` / ``openai-chat:*`` → ``OPENAI_BASE_URL`` /
   ``OPENAI_API_KEY``
+- ``qwen-vl:*`` → ``QWEN_VL_BASE_URL`` / ``QWEN_VL_API_KEY``。
+  本地无鉴权服务的 key 默认是 ``EMPTY``。
 
 ``api`` 专属的调节参数:
 
@@ -154,3 +161,66 @@ tool-calling 循环 *如何* 被编排, 以及能触达哪些 LLM / SDK 上有�
 
 两个上限都会以 ``finish(stuck)`` 优雅收尾, 不会硬崩, 因此可以放心
 调参 —— transcript 不会丢。
+
+本地 Qwen3.5 服务
+------------------
+
+``qwen-vl:`` provider 用 OpenAI Chat Completions 协议连接一个本地
+多模态模型服务。RPent 的相机帧会作为 base64 ``image_url`` 发送,
+tool schema 与 tool result 仍由现有 ``api`` planner 循环处理。不要加
+``--no-images``，否则 Qwen-VL 看不到机器人相机画面。
+
+客户端默认值已经与现有的 9B 启动脚本对齐:
+
+.. code-block:: bash
+
+   # Qwen/Qwen3.5-9B，以 Qwen3.5-9B 名称运行在 GPU 0、端口 8000
+   bash /home/dongyicheng/set_qwen9b.sh
+
+现有的 4B 启动脚本使用另一组模型名和端口:
+
+.. code-block:: bash
+
+   # Qwen/Qwen3.5-4B，以 Qwen3.5-4B 名称运行在 GPU 3、端口 8001
+   bash /home/dongyicheng/set_qwen4b.sh
+   export QWEN_VL_MODEL=Qwen3.5-4B
+   export QWEN_VL_BASE_URL=http://127.0.0.1:8001/v1
+
+在启动完整仿真前先验证模型列表、base64 图片与 OpenAI tool calls:
+
+.. code-block:: bash
+
+   conda activate rpent
+   cd /home/dongyicheng/rpent
+   python scripts/qwen_vl/check_server.py \
+     --base-url http://127.0.0.1:8000/v1
+
+现有启动脚本已开启 ``--reasoning-parser qwen3``、
+``--enable-auto-tool-choice`` 和 ``--tool-call-parser qwen3_coder``。
+这些参数不可省略：普通图片对话不加也能工作，但 RPent 只有在 vLLM
+返回结构化 ``tool_calls`` 时才能执行仿真工具。
+
+通过后启动 RPent:
+
+.. code-block:: bash
+
+   export PI05_CHECKPOINT_PATH=/path/to/rlinf-pi05-libero-130-fullshot-sft
+   export CUDA_VISIBLE_DEVICES=<pi05-gpu>
+   export QWEN_VL_BASE_URL=http://127.0.0.1:8000/v1
+   export QWEN_VL_API_KEY=EMPTY
+
+   rpent --env libero \
+     --suite libero_object_swap --task 2 --seed 0 \
+     --planner api \
+     --model qwen-vl:Qwen3.5-9B \
+     --max-tokens 4096
+
+9B 启动脚本提供 32K 上下文。RPent 首轮 system prompt 与工具 schema
+约占 8K tokens，因此把单次回复限制为 4K，可以给后续多轮工具结果留出空间。
+不要在只有 16K 上下文的 4B 服务上使用 ``--max-tokens 8192``，输入与
+预留输出之和可能直接超过上下文限制。
+
+Qwen3.5 和 Pi0.5 必须同时装入显存。当前 9B 脚本使用物理 GPU 0，
+4B 脚本使用物理 GPU 3；条件允许时给 Pi0.5 选择另一张空闲 GPU。
+两个脚本都把 vLLM 绑定到 ``0.0.0.0`` 且没有设置 API key，如果主机可被
+不可信网络访问，请用防火墙限制 8000/8001 端口。
