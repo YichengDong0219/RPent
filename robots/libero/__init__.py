@@ -66,6 +66,15 @@ def _add_cli_args(parser: argparse.ArgumentParser, use_dashboard: bool) -> None:
     """
     required = not use_dashboard
     parser.add_argument("--max-episode-steps", type=int, default=10000)
+    parser.add_argument(
+        "--hires-retention-steps",
+        type=int,
+        default=5,
+        help=(
+            "Number of recent high-resolution RGB/world-map steps to keep. "
+            "Use 0 to retain the complete high-resolution trajectory."
+        ),
+    )
     parser.add_argument("--libero-type", default=None,
                         choices=["standard", "pro", "plus"],
                         help="LIBERO variant (auto-routed from suite suffix if not set).")
@@ -96,6 +105,8 @@ def _parse_config(args: argparse.Namespace) -> RunConfig:
         raise ValueError("--suite is required")
     if args.task is None:
         raise ValueError("--task is required")
+    if args.hires_retention_steps < 0:
+        raise ValueError("--hires-retention-steps must be >= 0")
 
     recipe_tag = f"{args.suite.replace('libero_', '')}_t{args.task}_s{args.seed}"
     prompt_vars = {
@@ -265,5 +276,6 @@ def _init_runtime(
             },
         ),
         "model": VLAClient(vla_rpc),
+        "hires_retention_steps": args.hires_retention_steps,
     }
     return daemons, primitives_kwargs

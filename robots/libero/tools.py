@@ -42,9 +42,15 @@ class LiberoPrimitives:
         self,
         env: LiberoEnvClient,
         model: VLAClient,
+        hires_retention_steps: int = 5,
     ):
+        if hires_retention_steps < 0:
+            raise ValueError("hires_retention_steps must be >= 0")
         self.env = env
         self.model = model
+        # 0 means unlimited retention. A small non-zero default preserves the
+        # historical disk-saving behaviour for interactive/smoke runs.
+        self.hires_retention_steps = int(hires_retention_steps)
         self._last_obs = None
         self._last_obs_eef_pos = None
         self._last_obs_eef_z = None
@@ -1082,29 +1088,36 @@ def dump_state(primitives: LiberoPrimitives, output_dir: str, step_idx: int,
     except Exception as e:
         logger.warning("wrist high-res dump failed: %s", e)
 
-    for old_step in range(max(0, int(step_idx) - 4)):
-        for path in (
-            os.path.join(
-                output_dir,
-                "images_cam_hi",
-                f"image_cam_hi_{old_step:02d}.png",
-            ),
-            os.path.join(output_dir, "world_hi", f"world_hi_{old_step:02d}.npy"),
-            os.path.join(
-                output_dir,
-                "images_wrist_hi",
-                f"image_wrist_hi_{old_step:02d}.png",
-            ),
-            os.path.join(
-                output_dir,
-                "world_wrist_hi",
-                f"world_wrist_hi_{old_step:02d}.npy",
-            ),
-        ):
-            try:
-                os.unlink(path)
-            except FileNotFoundError:
-                pass
+    retention_steps = primitives.hires_retention_steps
+    if retention_steps > 0:
+        first_retained_step = max(0, int(step_idx) - retention_steps + 1)
+        for old_step in range(first_retained_step):
+            for path in (
+                os.path.join(
+                    output_dir,
+                    "images_cam_hi",
+                    f"image_cam_hi_{old_step:02d}.png",
+                ),
+                os.path.join(
+                    output_dir,
+                    "world_hi",
+                    f"world_hi_{old_step:02d}.npy",
+                ),
+                os.path.join(
+                    output_dir,
+                    "images_wrist_hi",
+                    f"image_wrist_hi_{old_step:02d}.png",
+                ),
+                os.path.join(
+                    output_dir,
+                    "world_wrist_hi",
+                    f"world_wrist_hi_{old_step:02d}.npy",
+                ),
+            ):
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
 
     blob = {
         "step_idx": step_idx,
