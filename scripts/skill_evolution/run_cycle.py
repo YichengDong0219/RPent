@@ -9,6 +9,7 @@ arguments are shared by parent and candidate.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import subprocess
@@ -43,8 +44,8 @@ def _write_json(path: Path, value: Any) -> None:
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
 
 
-def _prepare_libero(args: argparse.Namespace) -> None:
-    """Pin subprocesses to the requested checkout and isolated path config."""
+def _prepare_libero(args: argparse.Namespace) -> Path:
+    """Pin imports and configure resources for the selected LIBERO variant."""
     package_root = args.libero_root / "libero" / "libero"
     required = [
         args.libero_root / "setup.py",
@@ -75,15 +76,30 @@ def _prepare_libero(args: argparse.Namespace) -> None:
     else:
         inner_package.symlink_to(package_root, target_is_directory=True)
 
+    if args.libero_type == "standard":
+        runtime_package_root = package_root
+    elif args.libero_type == "pro":
+        runtime_spec = importlib.util.find_spec("liberopro.liberopro")
+        if runtime_spec is None or runtime_spec.origin is None:
+            raise RuntimeError("LIBERO_TYPE=pro but liberopro is not installed")
+        runtime_package_root = Path(runtime_spec.origin).resolve().parent
+    elif args.libero_type == "plus":
+        runtime_spec = importlib.util.find_spec("liberoplus.liberoplus")
+        if runtime_spec is None or runtime_spec.origin is None:
+            raise RuntimeError("LIBERO_TYPE=plus but liberoplus is not installed")
+        runtime_package_root = Path(runtime_spec.origin).resolve().parent
+    else:
+        raise ValueError(f"unsupported LIBERO type: {args.libero_type}")
+
     config_dir = services / "libero_config"
     _write_json(
         config_dir / "config.yaml",
         {
-            "benchmark_root": str(package_root),
-            "bddl_files": str(package_root / "bddl_files"),
-            "init_states": str(package_root / "init_files"),
-            "datasets": str(args.libero_root / "libero" / "datasets"),
-            "assets": str(package_root / "assets"),
+            "benchmark_root": str(runtime_package_root),
+            "bddl_files": str(runtime_package_root / "bddl_files"),
+            "init_states": str(runtime_package_root / "init_files"),
+            "datasets": str(runtime_package_root.parent / "datasets"),
+            "assets": str(runtime_package_root / "assets"),
         },
     )
     python_path = [str(overlay_root), str(args.repo_root)]
@@ -122,7 +138,9 @@ def _prepare_libero(args: argparse.Namespace) -> None:
     suite_probe = (
         "from rlinf.envs.libero import utils; "
         f"suite=utils.benchmark.get_benchmark_dict()[{args.suite!r}](); "
-        f"print(suite.get_task({args.task}).language)"
+        f"task=suite.get_task({args.task}); "
+        f"states=suite.get_task_init_states({args.task}); "
+        "print(f'{task.language} | init_states={len(states)}')"
     )
     completed = subprocess.run(
         [args.python, "-c", suite_probe],
@@ -136,6 +154,11 @@ def _prepare_libero(args: argparse.Namespace) -> None:
         f"[skill-evolve] discovery task: {completed.stdout.splitlines()[-1]}",
         flush=True,
     )
+    print(
+        f"[skill-evolve] {args.libero_type} resources: {runtime_package_root}",
+        flush=True,
+    )
+    return runtime_package_root
 
 
 def _run_case(
@@ -278,7 +301,7 @@ def main() -> int:
     args.libero_root = args.libero_root.resolve()
     args.experiment_dir = args.experiment_dir.resolve()
     args.experiment_dir.mkdir(parents=True, exist_ok=True)
-    _prepare_libero(args)
+    runtime_libero_root = _prepare_libero(args)
     libraries = args.experiment_dir / "libraries"
     parent = libraries / "S000"
     if not parent.exists():
@@ -290,6 +313,7 @@ def main() -> int:
         {
             "repo_root": str(args.repo_root),
             "libero_root": str(args.libero_root),
+            "runtime_libero_root": str(runtime_libero_root),
             "experiment_dir": str(args.experiment_dir),
             "memory_dir": str(args.memory_dir.resolve()),
             "discovery_seeds": _csv_ints(args.discovery_seeds),

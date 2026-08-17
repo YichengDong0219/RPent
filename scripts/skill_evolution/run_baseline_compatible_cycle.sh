@@ -8,7 +8,10 @@ set -Eeuo pipefail
 # =============================================================================
 # Quick configuration
 # =============================================================================
-EXPERIMENT_NAME="libero_object_t0_baseline_compatible_v1"
+EXPERIMENT_NAME="libero_object_t0_baseline_compatible_v2"
+# Base LIBERO checkout. Standard suites use its assets directly. PRO suites
+# use the installed liberopro assets selected by LIBERO_TYPE while retaining
+# this checkout for the shared LIBERO import surface.
 LIBERO_CHECKOUT="/home/dongyicheng/LIBERO"
 LIBERO_TYPE="pro"
 
