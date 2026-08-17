@@ -29,8 +29,14 @@ class LiberoToolkit(Toolkit):
         primitives_kwargs: dict[str, Any],
         video_path: str | None = None,
         dashboard: Any = None,
+        skill_library: str | None = None,
+        evolution_trace_path: str | None = None,
     ) -> None:
-        super().__init__(dashboard=dashboard)
+        super().__init__(
+            dashboard=dashboard,
+            skill_library=skill_library,
+            evolution_trace_path=evolution_trace_path,
+        )
         self._next_step: int = 0
         self._video_path: str | None = video_path
         self.init_primitives_clean(primitives_kwargs=primitives_kwargs)

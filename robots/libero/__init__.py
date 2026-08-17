@@ -45,6 +45,8 @@ def get_toolkit(
     primitives_kwargs: dict[str, Any],
     video_path: str | None = None,
     dashboard: Any = None,
+    skill_library: str | None = None,
+    evolution_trace_path: str | None = None,
 ):
     """Return the LIBERO toolkit (common tools + LIBERO primitives)."""
     from robots.libero.toolkit import LiberoToolkit
@@ -53,6 +55,8 @@ def get_toolkit(
         primitives_kwargs=primitives_kwargs,
         video_path=video_path,
         dashboard=dashboard,
+        skill_library=skill_library,
+        evolution_trace_path=evolution_trace_path,
     )
 
 

@@ -8,9 +8,10 @@ from __future__ import annotations
 
 import base64
 import json
+import traceback
 from collections.abc import Callable
 from dataclasses import dataclass, field
-import traceback
+from pathlib import Path
 from typing import Any, ClassVar
 
 from rpent.utils.templates import substitute
@@ -94,10 +95,31 @@ class Toolkit:
     :meth:`close` to release env-side primitives / servers at the end of the run.
     """
 
-    def __init__(self, *, dashboard: Any = None) -> None:
+    def __init__(
+        self,
+        *,
+        dashboard: Any = None,
+        skill_library: str | None = None,
+        evolution_trace_path: str | None = None,
+    ) -> None:
         # name -> (spec, handler)
         self._tools: dict[str, tuple[dict[str, Any], Callable[..., dict[str, Any]]]] = {}
         self._dashboard = dashboard
+        self._skill_library: Path | None = None
+        self._rendered_memory: Path | None = None
+        self._passive_trace = None
+        if skill_library is not None:
+            from rpent.evolution.library import load_manifest, rendered_memory_dir
+            from rpent.evolution.trace import PassiveTraceWriter
+
+            self._skill_library = Path(skill_library).resolve()
+            manifest = load_manifest(self._skill_library)
+            self._rendered_memory = rendered_memory_dir(self._skill_library)
+            trace_path = evolution_trace_path or "evolution_trace.jsonl"
+            self._passive_trace = PassiveTraceWriter(
+                trace_path,
+                library_id=str(manifest["library_id"]),
+            )
         self._register_common_tools()
 
     # ------------------------------------------------------------------
@@ -127,7 +149,65 @@ class Toolkit:
 
         for spec in common.TOOLS_SPEC:
             name = spec["name"]
-            self.add_tool(name, spec, common.TOOL_HANDLERS[name])
+            handler = common.TOOL_HANDLERS[name]
+            if self._rendered_memory is not None and name in {
+                "read_text_file",
+                "write_text_file",
+                "list_dir",
+            }:
+                handler = self._memory_view_handler(name, handler)
+            self.add_tool(name, spec, handler)
+
+    def _memory_alias(self, requested_path: str) -> tuple[Path, str] | None:
+        """Map the baseline memory path to the selected rendered snapshot."""
+        if self._rendered_memory is None or not requested_path:
+            return None
+        from rpent.utils.config import get_repo_root
+
+        requested = Path(requested_path)
+        resolved = requested.resolve() if requested.is_absolute() else (get_repo_root() / requested).resolve()
+        baseline_root = (get_repo_root() / "resources/libero/memory").resolve()
+        try:
+            relative = resolved.relative_to(baseline_root)
+        except ValueError:
+            return None
+        mapped = (self._rendered_memory / relative).resolve()
+        try:
+            mapped.relative_to(self._rendered_memory)
+        except ValueError:
+            return None
+        return mapped, str(relative)
+
+    def _memory_view_handler(
+        self,
+        name: str,
+        original: Callable[..., dict[str, Any]],
+    ) -> Callable[..., dict[str, Any]]:
+        """Redirect only baseline MEMORY accesses without changing schemas."""
+        from rpent.tools import common
+
+        def handler(**kwargs: Any) -> dict[str, Any]:
+            requested_path = str(kwargs.get("path", ""))
+            alias = self._memory_alias(requested_path)
+            if alias is None:
+                return original(**kwargs)
+            mapped, relative = alias
+            if name == "write_text_file":
+                return {"error": "the selected skill library is immutable"}
+            redirected = dict(kwargs)
+            redirected["path"] = str(mapped)
+            result = original(**redirected)
+            # Preserve the baseline-visible path.  The selected version is
+            # recorded in the trace rather than injected into the prompt.
+            if isinstance(result, dict) and "path" in result:
+                result = dict(result)
+                result["path"] = str(common._resolve(requested_path))
+            if name == "read_text_file" and "error" not in result:
+                assert self._passive_trace is not None
+                self._passive_trace.activate_memory(relative)
+            return result
+
+        return handler
 
     # ------------------------------------------------------------------
     # Planner-facing API
@@ -145,6 +225,14 @@ class Toolkit:
         if entry is None:
             return ToolResult(name=name, result={"error": f"unknown tool: {name}"})
         handler = entry[1]
+        call_event_id = None
+        if self._passive_trace is not None:
+            call_event_id = self._passive_trace.write(
+                "tool_call",
+                tool_name=name,
+                arguments=input_dict,
+                active_skill_ids=self._passive_trace.active_skill_ids,
+            )
         try:
             result = handler(**input_dict)
         except TypeError as e:
@@ -153,7 +241,41 @@ class Toolkit:
             result = {"error": str(e), "traceback": traceback.format_exc()}
         if self._dashboard is not None:
             self._dashboard.on_tool_result(name, result)
+        if self._passive_trace is not None:
+            self._passive_trace.write(
+                "tool_result",
+                tool_name=name,
+                call_event_id=call_event_id,
+                result=result,
+                active_skill_ids=self._passive_trace.active_skill_ids,
+            )
         return ToolResult(name=name, result=result)
+
+    def record_episode_outcome(
+        self,
+        *,
+        states: list[dict[str, Any]],
+        agent_error: str | None,
+    ) -> None:
+        """Record an authoritative outcome without changing planner control."""
+        if self._passive_trace is None:
+            return
+        valid_states = [state for state in states if isinstance(state, dict)]
+        self._passive_trace.write(
+            "episode_outcome",
+            benchmark_success=any(
+                bool(state.get("libero_terminated")) for state in valid_states
+            ),
+            final_libero_terminated=bool(
+                valid_states and valid_states[-1].get("libero_terminated")
+            ),
+            final_libero_truncated=bool(
+                valid_states and valid_states[-1].get("libero_truncated")
+            ),
+            state_count=len(valid_states),
+            agent_error=agent_error,
+            activated_skill_ids=self._passive_trace.active_skill_ids,
+        )
 
     # ------------------------------------------------------------------
     # Server lifecycle hooks (overridden by env toolkits)

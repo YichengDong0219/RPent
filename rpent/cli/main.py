@@ -130,6 +130,19 @@ def _build_argparser() -> argparse.ArgumentParser:
                          "file. Defaults to INFO when not set.")
     ap.add_argument("--interactive", "-i", action="store_true",
                     help="Interactive mode: opens an interactive cli session.")
+    ap.add_argument(
+        "--skill-library",
+        default=None,
+        help=(
+            "Immutable baseline-compatible skill library. The planner still "
+            "reads resources/libero/memory; runtime transparently serves this version."
+        ),
+    )
+    ap.add_argument(
+        "--evolution-trace",
+        default=None,
+        help="Passive JSONL trace path (only used with --skill-library).",
+    )
 
     return ap
 
@@ -249,6 +262,11 @@ def main() -> int:
         primitives_kwargs=primitives_kwargs,
         video_path=str(Path(output_dir) / "episode.mp4"),
         dashboard=dashboard_state,
+        skill_library=args.skill_library,
+        evolution_trace_path=(
+            args.evolution_trace
+            or str(Path(output_dir) / "evolution_trace.jsonl")
+        ),
     )
 
     # --- agent loop --------------------------------------------------------
@@ -275,8 +293,18 @@ def main() -> int:
             stats = result.stats
             agent_error = result.error
     except Exception as e:
+        agent_error = f"{type(e).__name__}: {e}"
         logger.error("EXCEPTION in agent loop: %s", e)
     finally:
+        states: list[dict] = []
+        states_path = Path(output_dir) / "states.json"
+        try:
+            loaded_states = json.loads(states_path.read_text())
+            if isinstance(loaded_states, list):
+                states = loaded_states
+        except (OSError, json.JSONDecodeError):
+            pass
+        toolkit.record_episode_outcome(states=states, agent_error=agent_error)
         # Agent-side: flush the episode video before the env+model
         recipe_path = toolkit.write_recipe(recipe_tag)
         logger.info("recipe: %s", recipe_path)
@@ -293,6 +321,8 @@ def main() -> int:
         "model": args.model,
         "elapsed_s": round(elapsed, 1),
         "finish": finish_result,
+        "agent_error": agent_error,
+        "skill_library": args.skill_library,
         "stats": stats,
         "messages": _serialize_messages(messages),
     }

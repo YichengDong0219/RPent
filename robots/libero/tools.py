@@ -10,9 +10,9 @@ from urllib.parse import urlsplit, urlunsplit
 import imageio.v2 as imageio
 import numpy as np
 
-from rpent.utils.vla_client import VLAClient
 from robots.libero.env_client import LiberoEnvClient
 from rpent.utils.logging import get_logger, get_output_dir
+from rpent.utils.vla_client import VLAClient
 
 logger = get_logger("libero")
 
@@ -195,7 +195,8 @@ class LiberoPrimitives:
             "peak_lift_m": post_min_peak_z - min_z,  # actual post-descent ascent
             "min_gripper_opening": min_grip,
             "final_gripper_opening": last_grip,
-            "libero_terminated": self.env.episode_done,
+            "libero_terminated": self.env.terminated,
+            "libero_truncated": self.env.truncated,
             "diagnostics": {
                 "start_eef_z": round(start_z, 4),
                 "peak_eef_z": round(peak_z, 4),
@@ -229,8 +230,8 @@ class LiberoPrimitives:
             self._vlm_chunk(instr)
             chunks_used = c + 1
             if self.env.episode_done:
-                task_success = True
                 break
+        task_success = self.env.terminated
 
         return {
             "name": "pi0_doubled",
@@ -240,7 +241,8 @@ class LiberoPrimitives:
             "contact_skill_executed": chunks_used > 0,
             "chunks_used": chunks_used,
             "max_chunks": max_chunks,
-            "libero_terminated": self.env.episode_done,
+            "libero_terminated": self.env.terminated,
+            "libero_truncated": self.env.truncated,
             "diagnostics": {
                 "mode": "contact_skill_success_by_libero_terminated",
                 "success_meaning": (
@@ -291,7 +293,8 @@ class LiberoPrimitives:
             "peak_lift_m": peak_z - start_z,
             "min_gripper_opening": min_grip,
             "final_gripper_opening": last_grip,
-            "libero_terminated": self.env.episode_done,
+            "libero_terminated": self.env.terminated,
+            "libero_truncated": self.env.truncated,
             "diagnostics": {"release_thresh": release_thresh},
         }
 
@@ -359,7 +362,8 @@ class LiberoPrimitives:
             "final_dist_m": round(float(np.linalg.norm(target - final)), 4),
             "steps_used": len(traj),
             "max_steps": max_steps,
-            "libero_terminated": self.env.episode_done,
+            "libero_terminated": self.env.terminated,
+            "libero_truncated": self.env.truncated,
         }
 
     def rotate_wrist(
@@ -435,7 +439,8 @@ class LiberoPrimitives:
             "final_yaw": round(final_yaw, 4),
             "final_err": round(float((target_yaw - final_yaw + np.pi) % (2 * np.pi) - np.pi), 4),
             "steps_used": len(traj),
-            "libero_terminated": self.env.episode_done,
+            "libero_terminated": self.env.terminated,
+            "libero_truncated": self.env.truncated,
         }
 
     def rotate_pitch(
@@ -519,7 +524,8 @@ class LiberoPrimitives:
             "final_err": round(float(
                 (target_pitch - final_pitch + np.pi) % (2 * np.pi) - np.pi), 4),
             "steps_used": len(traj),
-            "libero_terminated": self.env.episode_done,
+            "libero_terminated": self.env.terminated,
+            "libero_truncated": self.env.truncated,
         }
 
     def move_pose(
@@ -592,7 +598,8 @@ class LiberoPrimitives:
             "final_dist_m": round(float(np.linalg.norm(target - final)), 4),
             "final_pitch": round(_pitch_of(fq), 4),
             "steps_used": step + 1,
-            "libero_terminated": self.env.episode_done,
+            "libero_terminated": self.env.terminated,
+            "libero_truncated": self.env.truncated,
         }
 
     def release(
@@ -623,7 +630,8 @@ class LiberoPrimitives:
             "start_gripper_opening": round(start_grip, 4),
             "peak_gripper_opening": round(peak_grip, 4),
             "final_gripper_opening": round(self._last_obs_gripper, 4),
-            "libero_terminated": self.env.episode_done,
+            "libero_terminated": self.env.terminated,
+            "libero_truncated": self.env.truncated,
         }
 
     def set_gripper(
@@ -648,7 +656,8 @@ class LiberoPrimitives:
             "name": "set_gripper",
             "gripper": g,
             "steps": n,
-            "libero_terminated": self.env.episode_done,
+            "libero_terminated": self.env.terminated,
+            "libero_truncated": self.env.truncated,
         }
 
     # ---- introspection helpers (for LLM-in-the-loop) ----
@@ -706,7 +715,8 @@ class LiberoPrimitives:
             "max_chunks": max_chunks,
             "peak_lift_m": peak_z - start_z,
             "final_gripper_opening": self._last_obs_gripper,
-            "libero_terminated": self.env.episode_done,
+            "libero_terminated": self.env.terminated,
+            "libero_truncated": self.env.truncated,
         }
 
 
@@ -1121,7 +1131,8 @@ def dump_state(primitives: LiberoPrimitives, output_dir: str, step_idx: int,
 
     blob = {
         "step_idx": step_idx,
-        "libero_terminated": primitives.env.episode_done,
+        "libero_terminated": primitives.env.terminated,
+        "libero_truncated": primitives.env.truncated,
         "task_language": primitives.env.get_task_language(),
         "state": state,
         "world_map": agent_world_map,

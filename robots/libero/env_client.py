@@ -13,7 +13,6 @@ import numpy as np
 
 from rpent.utils.rpc import RpcClient
 
-
 _TIMEOUT_S = {
     "default": 30.0,
     "env.reset": 120.0,
@@ -36,6 +35,8 @@ class LiberoEnvClient:
         self._client = client
         self.return_all_frames = return_all_frames
         self.episode_done = False
+        self.terminated = False
+        self.truncated = False
         server_meta = self._client.call(
             "env.get_env_meta", timeout_s=_TIMEOUT_S["default"]
         )
@@ -48,12 +49,15 @@ class LiberoEnvClient:
         self.reset()
 
     def check_done(self, term, trunc) -> None:
-        if np.asarray(term).any() or np.asarray(trunc).any():
-            self.episode_done = True
+        self.terminated = self.terminated or bool(np.asarray(term).any())
+        self.truncated = self.truncated or bool(np.asarray(trunc).any())
+        self.episode_done = self.terminated or self.truncated
 
     def reset(self) -> tuple[dict, Any]:
         ret = self._client.call("env.reset", timeout_s=_TIMEOUT_S["env.reset"])
         self.episode_done = False
+        self.terminated = False
+        self.truncated = False
         return ret
 
     def step(self, action) -> tuple[dict, Any, np.ndarray, Any, Any]:
