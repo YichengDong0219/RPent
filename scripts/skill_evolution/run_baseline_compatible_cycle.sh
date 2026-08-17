@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One-click baseline-compatible skill evolution cycle.
+# One-click serial batch of baseline-compatible skill evolution cycles.
 # Edit only the quick configuration section, then run:
 #   bash scripts/skill_evolution/run_baseline_compatible_cycle.sh
 
@@ -8,16 +8,22 @@ set -Eeuo pipefail
 # =============================================================================
 # Quick configuration
 # =============================================================================
-EXPERIMENT_NAME="libero_object_t0_baseline_compatible_v2"
+EXPERIMENT_NAME="libero_object_baseline_compatible_case_colle"
 # Base LIBERO checkout. Standard suites use its assets directly. PRO suites
 # use the installed liberopro assets selected by LIBERO_TYPE while retaining
 # this checkout for the shared LIBERO import surface.
 LIBERO_CHECKOUT="/home/dongyicheng/LIBERO"
 LIBERO_TYPE="pro"
 
-# Evolution target and independent task seeds.
-EVAL_SUITE="libero_object_lan"
-EVAL_TASK_ID=0
+# Evolution targets, run serially in the listed order. Each entry uses
+# SUITE:TASK syntax and gets an independent S000 -> S001 cycle/output tree.
+EVAL_TASKS=(
+  "libero_object_lan:0"
+  "libero_object_lan:1"
+  "libero_object_lan:2"
+)
+# Independent seeds shared by every target above. Keep correction seeds held
+# out from discovery so candidate validation does not reuse proposal evidence.
 DISCOVERY_SEEDS="0,1,2"
 CORRECTION_SEEDS="3,4,5"
 # Use three baseline-proven cases; syntax is SUITE:TASK:SEED separated by ';'.
@@ -61,6 +67,35 @@ PYTHON_BIN="${CONDA_PREFIX}/bin/python"
 EXPERIMENT_DIR="${OUTPUT_ROOT}/${EXPERIMENT_NAME}"
 SERVICES_DIR="${EXPERIMENT_DIR}/services"
 mkdir -p "${SERVICES_DIR}"
+
+# Resolve and validate the complete batch before starting either shared service.
+EVAL_SUITES=()
+EVAL_TASK_IDS=()
+EVAL_TASK_DIRS=()
+declare -A SEEN_EVAL_TASKS=()
+for task_spec in "${EVAL_TASKS[@]}"; do
+  if [[ ! "${task_spec}" =~ ^([^:[:space:]]+):([0-9]+)$ ]]; then
+    echo "[skill-evolve] ERROR: invalid EVAL_TASKS entry '${task_spec}'; expected SUITE:TASK" >&2
+    exit 1
+  fi
+  eval_suite="${BASH_REMATCH[1]}"
+  eval_task_id=$((10#${BASH_REMATCH[2]}))
+  eval_task_key="${eval_suite}:$eval_task_id"
+  if [[ -n "${SEEN_EVAL_TASKS[${eval_task_key}]:-}" ]]; then
+    echo "[skill-evolve] ERROR: duplicate EVAL_TASKS entry '${eval_task_key}'" >&2
+    exit 1
+  fi
+  SEEN_EVAL_TASKS["${eval_task_key}"]=1
+  EVAL_SUITES+=("${eval_suite}")
+  EVAL_TASK_IDS+=("${eval_task_id}")
+  printf -v eval_task_dir '%s/tasks/%s__t%03d' \
+    "${EXPERIMENT_DIR}" "${eval_suite}" "${eval_task_id}"
+  EVAL_TASK_DIRS+=("${eval_task_dir}")
+done
+if (( ${#EVAL_SUITES[@]} == 0 )); then
+  echo "[skill-evolve] ERROR: EVAL_TASKS must contain at least one SUITE:TASK entry" >&2
+  exit 1
+fi
 
 # Pin imports to the user-selected LIBERO checkout without editing that repo.
 export PYTHONPATH="${LIBERO_CHECKOUT}/libero:${PYTHONPATH:-}"
@@ -139,21 +174,44 @@ if [[ "${VLA_READY}" != "1" ]]; then
 fi
 echo "[skill-evolve] Pi0.5 service ready: ${VLA_ENDPOINT}"
 
-"${PYTHON_BIN}" scripts/skill_evolution/run_cycle.py \
-  --repo-root "${REPO_ROOT}" \
-  --libero-root "${LIBERO_CHECKOUT}" \
-  --experiment-dir "${EXPERIMENT_DIR}" \
-  --memory-dir "${REPO_ROOT}/resources/libero/memory" \
-  --suite "${EVAL_SUITE}" --task "${EVAL_TASK_ID}" \
-  --discovery-seeds "${DISCOVERY_SEEDS}" \
-  --correction-seeds "${CORRECTION_SEEDS}" \
-  --preservation-cases "${PRESERVATION_CASES}" \
-  --planner "${PLANNER}" --model "${PLANNER_MODEL}" \
-  --qwen-base-url "${QWEN_BASE_URL}" --qwen-api-key "${QWEN_API_KEY}" \
-  --vla-endpoint "${VLA_ENDPOINT}" --libero-type "${LIBERO_TYPE}" \
-  --cuda-device "${VLA_GPU}" --max-tokens "${MAX_TOKENS}" \
-  --curator-max-tokens "${CURATOR_MAX_TOKENS}" --max-turns "${MAX_TURNS}" \
-  --max-episode-steps "${MAX_EPISODE_STEPS}" \
-  --hires-retention-steps "${HIRES_RETENTION_STEPS}" \
-  --run-timeout-s "${RUN_TIMEOUT_S}" --max-attempts "${MAX_ATTEMPTS}" \
-  --python "${PYTHON_BIN}"
+BATCH_EXIT_CODE=0
+TASK_EXIT_CODES=()
+for task_index in "${!EVAL_SUITES[@]}"; do
+  eval_suite="${EVAL_SUITES[task_index]}"
+  eval_task_id="${EVAL_TASK_IDS[task_index]}"
+  eval_task_dir="${EVAL_TASK_DIRS[task_index]}"
+  echo "[skill-evolve] BATCH $((task_index + 1))/${#EVAL_SUITES[@]}: ${eval_suite}:$eval_task_id"
+  echo "[skill-evolve] task output: ${eval_task_dir}"
+
+  task_exit_code=0
+  "${PYTHON_BIN}" scripts/skill_evolution/run_cycle.py \
+    --repo-root "${REPO_ROOT}" \
+    --libero-root "${LIBERO_CHECKOUT}" \
+    --experiment-dir "${eval_task_dir}" \
+    --memory-dir "${REPO_ROOT}/resources/libero/memory" \
+    --suite "${eval_suite}" --task "${eval_task_id}" \
+    --discovery-seeds "${DISCOVERY_SEEDS}" \
+    --correction-seeds "${CORRECTION_SEEDS}" \
+    --preservation-cases "${PRESERVATION_CASES}" \
+    --planner "${PLANNER}" --model "${PLANNER_MODEL}" \
+    --qwen-base-url "${QWEN_BASE_URL}" --qwen-api-key "${QWEN_API_KEY}" \
+    --vla-endpoint "${VLA_ENDPOINT}" --libero-type "${LIBERO_TYPE}" \
+    --cuda-device "${VLA_GPU}" --max-tokens "${MAX_TOKENS}" \
+    --curator-max-tokens "${CURATOR_MAX_TOKENS}" --max-turns "${MAX_TURNS}" \
+    --max-episode-steps "${MAX_EPISODE_STEPS}" \
+    --hires-retention-steps "${HIRES_RETENTION_STEPS}" \
+    --run-timeout-s "${RUN_TIMEOUT_S}" --max-attempts "${MAX_ATTEMPTS}" \
+    --python "${PYTHON_BIN}" || task_exit_code=$?
+
+  TASK_EXIT_CODES+=("${task_exit_code}")
+  if (( task_exit_code != 0 )); then
+    BATCH_EXIT_CODE=1
+    echo "[skill-evolve] WARN: ${eval_suite}:$eval_task_id exited with status ${task_exit_code}; continuing batch" >&2
+  fi
+done
+
+echo "[skill-evolve] Batch summary:"
+for task_index in "${!EVAL_SUITES[@]}"; do
+  echo "[skill-evolve]   ${EVAL_SUITES[task_index]}:${EVAL_TASK_IDS[task_index]} -> exit ${TASK_EXIT_CODES[task_index]} (${EVAL_TASK_DIRS[task_index]})"
+done
+exit "${BATCH_EXIT_CODE}"
