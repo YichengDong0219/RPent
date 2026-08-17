@@ -13,12 +13,12 @@ LIBERO_CHECKOUT="/home/dongyicheng/LIBERO"
 LIBERO_TYPE="pro"
 
 # Evolution target and independent task seeds.
-EVAL_SUITE="libero_object"
+EVAL_SUITE="libero_object_lan"
 EVAL_TASK_ID=0
 DISCOVERY_SEEDS="0,1,2"
 CORRECTION_SEEDS="3,4,5"
 # Use three baseline-proven cases; syntax is SUITE:TASK:SEED separated by ';'.
-PRESERVATION_CASES="libero_object_lan:0:0;libero_object_lan:1:0;libero_object_lan:2:0"
+PRESERVATION_CASES="libero_spatial_swap:8:0;libero_object_swap:0:0;libero_object_task:6:0"
 
 # Execution planner (same values as the baseline experiment).
 PLANNER="api"
