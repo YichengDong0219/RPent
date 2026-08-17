@@ -36,6 +36,7 @@ START_SHARED_VLA=1
 VLA_ENDPOINT="http://127.0.0.1:18081"
 VLA_HOST="127.0.0.1"
 VLA_PORT=18081
+VLA_READY_TIMEOUT_S=600
 
 # Runtime and output.
 CONDA_ROOT="/home/dongyicheng/miniconda3"
@@ -64,13 +65,25 @@ export LIBERO_TYPE
 export QWEN_VL_BASE_URL="${QWEN_BASE_URL}"
 export QWEN_VL_API_KEY="${QWEN_API_KEY}"
 export HF_HUB_OFFLINE=1
+export NO_PROXY="${NO_PROXY:-127.0.0.1,localhost}"
+export no_proxy="${no_proxy:-127.0.0.1,localhost}"
 
 VLA_PID=""
+VLA_STDIN_FIFO=""
+VLA_STDIN_FD=""
+VLA_STDIN_OWNED=0
 cleanup() {
   if [[ -n "${VLA_PID}" ]]; then
     "${PYTHON_BIN}" scripts/baseline/baseline_results.py shutdown-rpc \
       --url "${VLA_ENDPOINT}" --timeout-s 10 >/dev/null 2>&1 || true
     wait "${VLA_PID}" 2>/dev/null || true
+  fi
+  if [[ -n "${VLA_STDIN_FD}" ]]; then
+    exec {VLA_STDIN_FD}>&-
+  fi
+  if [[ "${VLA_STDIN_OWNED}" == "1" && -n "${VLA_STDIN_FIFO}" \
+      && -p "${VLA_STDIN_FIFO}" ]]; then
+    rm -f -- "${VLA_STDIN_FIFO}"
   fi
 }
 trap cleanup EXIT INT TERM
@@ -82,15 +95,46 @@ cd "${REPO_ROOT}"
   --model "${PLANNER_MODEL#qwen-vl:}"
 
 if [[ "${START_SHARED_VLA}" == "1" ]]; then
+  VLA_STDIN_FIFO="${SERVICES_DIR}/vla_stdin.fifo"
+  if [[ -e "${VLA_STDIN_FIFO}" ]]; then
+    echo "[skill-evolve] ERROR: stale VLA stdin FIFO: ${VLA_STDIN_FIFO}" >&2
+    exit 1
+  fi
+  mkfifo "${VLA_STDIN_FIFO}"
+  VLA_STDIN_OWNED=1
+  # RpcFacade watches stdin for EOF as its parent-death signal. Keep both
+  # ends of this FIFO open for the complete cycle so a Bash background job
+  # does not receive /dev/null and shut itself down immediately.
+  exec {VLA_STDIN_FD}<>"${VLA_STDIN_FIFO}"
   CUDA_VISIBLE_DEVICES="${VLA_GPU}" \
     "${PYTHON_BIN}" robots/libero/vla_server.py \
       --transport http --host "${VLA_HOST}" --port "${VLA_PORT}" \
       --model-path "${PI05_CHECKPOINT}" \
+      < "${VLA_STDIN_FIFO}" \
       > "${SERVICES_DIR}/vla_server.log" 2>&1 &
   VLA_PID=$!
 fi
-"${PYTHON_BIN}" scripts/baseline/baseline_results.py wait-rpc \
-  --url "${VLA_ENDPOINT}" --timeout-s 600 --interval-s 2
+VLA_READY=0
+VLA_READY_DEADLINE=$(( $(date +%s) + VLA_READY_TIMEOUT_S ))
+while (( $(date +%s) < VLA_READY_DEADLINE )); do
+  if [[ -n "${VLA_PID}" ]] && ! kill -0 "${VLA_PID}" 2>/dev/null; then
+    echo "[skill-evolve] ERROR: Pi0.5 service exited during startup" >&2
+    tail -n 100 "${SERVICES_DIR}/vla_server.log" >&2 || true
+    exit 1
+  fi
+  if "${PYTHON_BIN}" scripts/baseline/baseline_results.py wait-rpc \
+      --url "${VLA_ENDPOINT}" --timeout-s 2 --interval-s 0.5 \
+      >/dev/null 2>&1; then
+    VLA_READY=1
+    break
+  fi
+done
+if [[ "${VLA_READY}" != "1" ]]; then
+  echo "[skill-evolve] ERROR: Pi0.5 service was not ready within ${VLA_READY_TIMEOUT_S}s" >&2
+  tail -n 100 "${SERVICES_DIR}/vla_server.log" >&2 || true
+  exit 1
+fi
+echo "[skill-evolve] Pi0.5 service ready: ${VLA_ENDPOINT}"
 
 "${PYTHON_BIN}" scripts/skill_evolution/run_cycle.py \
   --repo-root "${REPO_ROOT}" \
