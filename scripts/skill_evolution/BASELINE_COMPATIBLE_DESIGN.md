@@ -25,14 +25,14 @@ reviewed resources/libero/memory
   -> baseline planner reads resources/libero/memory/*
   -> runtime transparently serves S000/rendered_memory/*
   -> passive trace: memory read -> tool call/result -> official outcome
-  -> discovery evidence (seeds 0-2)
-  -> isolated offline Qwen curator
-  -> one exact Markdown snippet patch
+  -> OptimizerEvidence/v1 (seeds 0-2; structured trace, no console parsing)
+  -> independent stronger multimodal skill optimizer
+  -> no_patch or one exact MEMORY-index/leaf snippet patch
   -> candidate complete rendered-memory snapshot
   -> paired correction replay: parent vs candidate (seeds 3-5)
   -> paired preservation replay on baseline-proven cases
   -> accepted / rejected / pending
-  -> accepted only: materialize immutable libraries/S001
+  -> accepted only: materialize next immutable libraries/SNNN
 ```
 
 Planner 仍按 baseline prompt 先读完整 `MEMORY.md`，再读相关叶子 skill。读取叶子文件
@@ -50,10 +50,18 @@ Planner 仍按 baseline prompt 先读完整 `MEMORY.md`，再读相关叶子 ski
 
 ## Patch 与接纳
 
-`SkillPatch/v1` 每次只允许修改一个 Markdown 文件中的一个精确 snippet，字段为
-`activation/procedure/termination/recovery` 之一，且至少引用两条 discovery 轨迹。
-当前自动 curator 主要面向已读取叶子 skill 的 replace；novel task 若没有可归因叶子，
-应形成 evidence-insufficient 结果，而不是把错误归给无关 skill。
+`SkillPatch/v2` 每次只允许修改一个 Markdown 文件中的一个精确 snippet，且至少引用两条
+discovery 轨迹。对 `MEMORY.md` 只允许替换 `Reusable manipulation patterns` 下指向目标
+leaf 的一个 routing bullet；对 leaf 只允许修改
+`activation/procedure/termination/recovery` 之一。目标 leaf 必须在有效 discovery 中真实
+读过。novel task 若没有可归因 leaf，形成 `no_patch/insufficient_evidence`，不把错误归给
+无关 skill。
+
+Optimizer 的版本化约束位于
+[`skill_optimizer/SKILL.md`](./skill_optimizer/SKILL.md)。它与 execution planner 使用独立
+OpenAI-compatible 多模态服务。每条 rollout 从 `evolution_trace.jsonl`、transcript、
+`states.json` 和最多六张精选图片生成 `optimizer_evidence.json`；thinking 与
+`console.log` 不进入 optimizer 输入。
 
 接纳条件：correction 成功数比 parent 至少增加 1、parent-success preservation case
 零退化、目标 skill 在 candidate correction 中至少激活 2 次、无安全违规。运行或
@@ -68,7 +76,10 @@ bash scripts/skill_evolution/run_baseline_compatible_cycle.sh
 ```
 
 脚本快速配置区暴露 suite/task、discovery/correction seeds、preservation cases、Qwen
-模型和服务地址、Pi0.5 checkpoint、GPU、VLA endpoint、token/turn/episode budget。
+模型和服务地址、独立 optimizer 的 URL/key/model/token/timeout/图片及 patch budget、
+Pi0.5 checkpoint、GPU、VLA endpoint、token/turn/episode budget。每次启动只创建一个
+新 `cycle_NNN`；它从编号最大的 accepted `libraries/SNNN` 开始。rejected candidate 和
+旧 cycle 永不覆盖。
 
 首次正式 evolve 前应先做 A/A 检查：同一组 baseline case 分别使用原始 MEMORY 与
 `S000` memory view。二者允许存在模型采样和物理仿真的随机波动，但不应出现工具缺失、
@@ -80,4 +91,4 @@ VLA horizon 改变、prompt 缺失或系统性动作模式变化。
 - 视觉状态到具体 skill step 的强因果对齐；
 - 自动挑选三个语义不同且已由 baseline 验证成功的 preservation cases；当前由脚本
   明确配置，避免系统悄悄使用失败 case；
-- 多轮 library chain 的自动调度；当前一键入口执行一个 S000→S001 cycle。
+- 自动从 baseline 结果库挑选 preservation cases；当前仍由脚本明确配置。

@@ -90,7 +90,7 @@ def decide_admission(
         reasons.append("preservation_regression")
     if activations < minimum_activations:
         reasons.append("insufficient_candidate_activation")
-    if any(result.get("safety_violations") for result in cc.values()):
+    if any(result.get("safety_violations") for result in all_results):
         reasons.append("safety_violation")
     return AdmissionDecision(
         "rejected" if reasons else "accepted",

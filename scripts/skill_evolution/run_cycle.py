@@ -18,8 +18,15 @@ from pathlib import Path
 from typing import Any
 
 from rpent.evolution.admission import decide_admission
-from rpent.evolution.curator import propose_patch
+from rpent.evolution.evidence import aggregate_evidence, build_optimizer_evidence
 from rpent.evolution.library import apply_patch, create_snapshot, rendered_memory_dir
+from rpent.evolution.library import load_manifest
+from rpent.evolution.optimizer import (
+    InvalidPatchError,
+    OptimizerInfrastructureError,
+    OptimizerProtocolError,
+    optimize_skills,
+)
 from rpent.evolution.rollout import summarize_rollout
 
 VALID_STATUSES = {"success", "benchmark_failure"}
@@ -170,9 +177,10 @@ def _run_case(
     suite: str,
     task: int,
     seed: int,
+    cycle_name: str,
 ) -> dict[str, Any]:
     case_id = f"{suite}__t{task:03d}__s{seed:06d}"
-    run_root = args.experiment_dir / "rollouts" / phase / role / case_id
+    run_root = args.experiment_dir / "rollouts" / cycle_name / phase / role / case_id
     result_path = run_root / "result.json"
     if result_path.is_file():
         return json.loads(result_path.read_text())
@@ -249,8 +257,19 @@ def _run_case(
                 "task": task,
                 "seed": seed,
                 "attempt": attempt,
+                "vla_endpoint": args.vla_endpoint,
             }
         )
+        _write_json(attempt_dir / "result.json", last_result)
+        evidence = build_optimizer_evidence(
+            attempt_dir,
+            rollout_result=last_result,
+            max_images=args.optimizer_max_images_per_rollout,
+            max_turns=args.max_turns,
+        )
+        evidence_path = attempt_dir / "optimizer_evidence.json"
+        _write_json(evidence_path, evidence)
+        last_result["optimizer_evidence"] = str(evidence_path)
         _write_json(attempt_dir / "result.json", last_result)
         print(f"[skill-evolve] RESULT {case_id}: {last_result['status']}", flush=True)
         if last_result["status"] in VALID_STATUSES:
@@ -258,6 +277,45 @@ def _run_case(
     assert last_result is not None
     _write_json(result_path, last_result)
     return last_result
+
+
+def _latest_accepted_library(libraries: Path) -> tuple[Path, int]:
+    candidates = []
+    for path in libraries.glob("S[0-9][0-9][0-9]"):
+        try:
+            number = int(path.name[1:])
+            manifest = load_manifest(path)
+        except (ValueError, OSError, json.JSONDecodeError):
+            continue
+        if manifest.get("library_id") == path.name:
+            candidates.append((number, path))
+    if not candidates:
+        raise RuntimeError("no valid accepted skill library found")
+    number, path = max(candidates)
+    return path, number
+
+
+def _next_cycle(experiment_dir: Path) -> tuple[Path, str]:
+    numbers = []
+    for path in experiment_dir.glob("cycle_[0-9][0-9][0-9]"):
+        try:
+            numbers.append(int(path.name.split("_")[1]))
+        except (IndexError, ValueError):
+            continue
+    number = max(numbers, default=0) + 1
+    name = f"cycle_{number:03d}"
+    path = experiment_dir / name
+    path.mkdir(parents=False, exist_ok=False)
+    return path, name
+
+
+def _evidence_for(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    values = []
+    for result in results:
+        path = result.get("optimizer_evidence")
+        if path and Path(path).is_file():
+            values.append(json.loads(Path(path).read_text()))
+    return values
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -283,7 +341,16 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--libero-type", default="pro")
     parser.add_argument("--cuda-device", default="0")
     parser.add_argument("--max-tokens", type=int, default=4096)
-    parser.add_argument("--curator-max-tokens", type=int, default=4096)
+    parser.add_argument("--optimizer-base-url", required=True)
+    parser.add_argument("--optimizer-api-key", default="EMPTY")
+    parser.add_argument("--optimizer-model", required=True)
+    parser.add_argument("--optimizer-max-tokens", type=int, default=8192)
+    parser.add_argument("--optimizer-timeout-s", type=int, default=600)
+    parser.add_argument("--optimizer-max-images-per-rollout", type=int, default=6)
+    parser.add_argument("--optimizer-skill-path", type=Path, required=True)
+    parser.add_argument("--max-patch-lines", type=int, default=24)
+    parser.add_argument("--max-patch-new-chars", type=int, default=2000)
+    parser.add_argument("--max-patch-growth-chars", type=int, default=1000)
     parser.add_argument("--max-turns", type=int, default=40)
     parser.add_argument("--max-episode-steps", type=int, default=10000)
     parser.add_argument("--hires-retention-steps", type=int, default=5)
@@ -303,12 +370,24 @@ def main() -> int:
     args.experiment_dir.mkdir(parents=True, exist_ok=True)
     runtime_libero_root = _prepare_libero(args)
     libraries = args.experiment_dir / "libraries"
-    parent = libraries / "S000"
-    if not parent.exists():
+    initial = libraries / "S000"
+    if not initial.exists():
         print("[skill-evolve] snapshot exact baseline MEMORY -> S000", flush=True)
-        create_snapshot(args.memory_dir, parent, library_id="S000")
+        create_snapshot(args.memory_dir, initial, library_id="S000")
+    parent, parent_number = _latest_accepted_library(libraries)
+    cycle_dir, cycle_name = _next_cycle(args.experiment_dir)
+    optimizer_dir = cycle_dir / "optimizer"
+    optimizer_dir.mkdir()
+    next_library_id = f"S{parent_number + 1:03d}"
+    print(
+        f"[skill-evolve] {cycle_name}: parent={parent.name}, next={next_library_id}",
+        flush=True,
+    )
 
-    resolved = vars(args).copy()
+    resolved = {
+        key: str(value) if isinstance(value, Path) else value
+        for key, value in vars(args).items()
+    }
     resolved.update(
         {
             "repo_root": str(args.repo_root),
@@ -321,7 +400,11 @@ def main() -> int:
             "preservation_cases": _preservation_cases(args.preservation_cases),
         }
     )
-    _write_json(args.experiment_dir / "resolved_config.json", resolved)
+    resolved["qwen_api_key"] = "<redacted>"
+    resolved["optimizer_api_key"] = "<redacted>"
+    resolved["parent_library"] = str(parent)
+    resolved["cycle"] = cycle_name
+    _write_json(cycle_dir / "resolved_config.json", resolved)
 
     discovery = [
         _run_case(
@@ -332,80 +415,143 @@ def main() -> int:
             suite=args.suite,
             task=args.task,
             seed=seed,
+            cycle_name=cycle_name,
         )
         for seed in _csv_ints(args.discovery_seeds)
     ]
     valid_discovery = [item for item in discovery if item["status"] in VALID_STATUSES]
-    cycle_dir = args.experiment_dir / "cycle_001"
-    cycle_dir.mkdir(parents=True, exist_ok=True)
+    discovery_evidence = _evidence_for(discovery)
+    if discovery_evidence:
+        batch = aggregate_evidence(discovery_evidence)
+        _write_json(optimizer_dir / "evidence.json", batch)
+        _write_json(
+            optimizer_dir / "image_manifest.json",
+            [
+                {**image, "run_id": item["identity"]["run_id"]}
+                for item in discovery_evidence
+                for image in item.get("visual_evidence", [])
+            ],
+        )
     if len(valid_discovery) < 2:
         value = {
-            "decision": "insufficient_evidence",
+            "status": "no_patch",
+            "decision": "no_patch",
+            "problem_type": "insufficient_evidence",
             "reason": "fewer than two valid discovery rollouts",
+            "parent_library": str(parent),
         }
         _write_json(cycle_dir / "cycle_result.json", value)
         print(json.dumps(value, ensure_ascii=False, indent=2))
-        return 2
+        return 0
 
     try:
-        patch = propose_patch(
-            rollout_results=valid_discovery,
+        decision = optimize_skills(
+            evidence=discovery_evidence,
             memory_dir=rendered_memory_dir(parent),
-            base_url=args.qwen_base_url,
-            api_key=args.qwen_api_key,
-            model=args.model.removeprefix("qwen-vl:"),
-            max_tokens=args.curator_max_tokens,
+            skill_path=args.optimizer_skill_path,
+            base_url=args.optimizer_base_url,
+            api_key=args.optimizer_api_key,
+            model=args.optimizer_model,
+            output_dir=optimizer_dir,
+            max_tokens=args.optimizer_max_tokens,
+            timeout_s=args.optimizer_timeout_s,
+            max_patch_lines=args.max_patch_lines,
+            max_patch_new_chars=args.max_patch_new_chars,
+            max_patch_growth_chars=args.max_patch_growth_chars,
         )
-    except Exception as exc:
+    except OptimizerInfrastructureError as exc:
         value = {
-            "decision": "insufficient_evidence",
-            "reason": f"curator did not produce a valid attributable patch: {exc}",
+            "status": "pending",
+            "decision": "pending",
+            "reason": "optimizer_infrastructure_error",
+            "detail": str(exc),
+            "parent_library": str(parent),
         }
         _write_json(cycle_dir / "cycle_result.json", value)
         print(json.dumps(value, ensure_ascii=False, indent=2))
         return 2
+    except OptimizerProtocolError as exc:
+        value = {
+            "status": "pending",
+            "decision": "pending",
+            "reason": "optimizer_protocol_error",
+            "detail": str(exc),
+            "parent_library": str(parent),
+        }
+        _write_json(cycle_dir / "cycle_result.json", value)
+        print(json.dumps(value, ensure_ascii=False, indent=2))
+        return 2
+    except InvalidPatchError as exc:
+        value = {
+            "status": "rejected",
+            "decision": "rejected",
+            "reason": "invalid_patch",
+            "detail": str(exc),
+            "parent_library": str(parent),
+        }
+        _write_json(cycle_dir / "cycle_result.json", value)
+        print(json.dumps(value, ensure_ascii=False, indent=2))
+        return 0
+    if decision.decision == "no_patch":
+        value = {
+            "status": "no_patch",
+            "decision": "no_patch",
+            "problem_type": decision.problem_type,
+            "causal_summary": decision.causal_summary,
+            "parent_library": str(parent),
+        }
+        _write_json(cycle_dir / "cycle_result.json", value)
+        print(json.dumps(value, ensure_ascii=False, indent=2))
+        return 0
+    assert decision.patch is not None
+    patch = decision.patch
     patch_path = cycle_dir / "candidate.patch.json"
     _write_json(patch_path, patch.model_dump(mode="json"))
     candidate = cycle_dir / "candidate_library"
-    if not candidate.exists():
-        apply_patch(parent, patch, candidate, library_id="S001-candidate")
+    apply_patch(parent, patch, candidate, library_id=f"{next_library_id}-candidate")
 
     correction_parent = []
     correction_candidate = []
     for seed in _csv_ints(args.correction_seeds):
         correction_parent.append(
-            _run_case(args, phase="correction", role="parent", library=parent, suite=args.suite, task=args.task, seed=seed)
+            _run_case(args, phase="correction", role="parent", library=parent, suite=args.suite, task=args.task, seed=seed, cycle_name=cycle_name)
         )
         correction_candidate.append(
-            _run_case(args, phase="correction", role="candidate", library=candidate, suite=args.suite, task=args.task, seed=seed)
+            _run_case(args, phase="correction", role="candidate", library=candidate, suite=args.suite, task=args.task, seed=seed, cycle_name=cycle_name)
         )
 
     preservation_parent = []
     preservation_candidate = []
     for suite, task, seed in _preservation_cases(args.preservation_cases):
         preservation_parent.append(
-            _run_case(args, phase="preservation", role="parent", library=parent, suite=suite, task=task, seed=seed)
+            _run_case(args, phase="preservation", role="parent", library=parent, suite=suite, task=task, seed=seed, cycle_name=cycle_name)
         )
         preservation_candidate.append(
-            _run_case(args, phase="preservation", role="candidate", library=candidate, suite=suite, task=task, seed=seed)
+            _run_case(args, phase="preservation", role="candidate", library=candidate, suite=suite, task=task, seed=seed, cycle_name=cycle_name)
         )
 
-    target_skill_id = Path(patch.target).stem
     decision = decide_admission(
         correction_parent=correction_parent,
         correction_candidate=correction_candidate,
         preservation_parent=preservation_parent,
         preservation_candidate=preservation_candidate,
-        target_skill_id=target_skill_id,
+        target_skill_id=patch.target_skill_id,
         minimum_activations=args.minimum_activations,
     )
     decision_value = decision.to_dict()
     _write_json(cycle_dir / "admission.json", decision_value)
     if decision.decision == "accepted":
-        admitted = libraries / "S001"
-        if not admitted.exists():
-            apply_patch(parent, patch, admitted, library_id="S001")
+        admitted = libraries / next_library_id
+        apply_patch(parent, patch, admitted, library_id=next_library_id)
         decision_value["admitted_library"] = str(admitted)
+    decision_value.update(
+        {
+            "status": decision.decision,
+            "parent_library": str(parent),
+            "candidate_library": str(candidate),
+            "target_skill_id": patch.target_skill_id,
+        }
+    )
     _write_json(cycle_dir / "cycle_result.json", decision_value)
     print(json.dumps(decision_value, ensure_ascii=False, indent=2))
     return 0

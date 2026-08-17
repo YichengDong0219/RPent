@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from rpent.evolution.admission import decide_admission
-from rpent.evolution.curator import propose_patch
+from rpent.evolution.evidence import build_optimizer_evidence
 from rpent.evolution.library import (
     apply_patch,
     create_snapshot,
@@ -16,7 +16,12 @@ from rpent.evolution.library import (
     rendered_memory_dir,
 )
 from rpent.evolution.rollout import summarize_rollout
-from rpent.evolution.schemas import SkillPatch
+from rpent.evolution.optimizer import (
+    check_optimizer_service,
+    optimize_skills,
+    validate_optimizer_decision,
+)
+from rpent.evolution.schemas import SkillOptimizationDecision
 
 
 def _write(path: str | Path, value: Any) -> None:
@@ -59,15 +64,33 @@ def _parser() -> argparse.ArgumentParser:
     record.add_argument("--process-exit-code", type=int, default=0)
     record.add_argument("--output", required=True)
 
-    propose = sub.add_parser("propose")
-    propose.add_argument("--result", action="append", required=True)
+    build = sub.add_parser("build-evidence")
+    build.add_argument("--episode-dir", required=True)
+    build.add_argument("--result", default=None)
+    build.add_argument("--max-images", type=int, default=6)
+    build.add_argument("--max-turns", type=int, default=None)
+    build.add_argument("--output", required=True)
+
+    propose = sub.add_parser("optimize", aliases=["propose"])
+    propose.add_argument("--evidence", action="append", required=True)
     propose.add_argument("--library", required=True)
+    propose.add_argument("--skill-path", required=True)
     propose.add_argument("--base-url", required=True)
     propose.add_argument("--api-key", default="EMPTY")
     propose.add_argument("--model", required=True)
-    propose.add_argument("--max-tokens", type=int, default=4096)
+    propose.add_argument("--max-tokens", type=int, default=8192)
+    propose.add_argument("--timeout-s", type=int, default=600)
+    propose.add_argument("--max-patch-lines", type=int, default=24)
+    propose.add_argument("--max-patch-new-chars", type=int, default=2000)
+    propose.add_argument("--max-patch-growth-chars", type=int, default=1000)
     propose.add_argument("--response-file", default=None)
     propose.add_argument("--output", required=True)
+
+    check = sub.add_parser("check-optimizer")
+    check.add_argument("--base-url", required=True)
+    check.add_argument("--api-key", default="EMPTY")
+    check.add_argument("--model", required=True)
+    check.add_argument("--timeout-s", type=int, default=60)
 
     admit = sub.add_parser("admit")
     admit.add_argument("--correction-parent", action="append", required=True)
@@ -98,22 +121,64 @@ def main() -> int:
             case_id=args.case_id,
             process_exit_code=args.process_exit_code,
         )
+        evidence_path = Path(args.episode_dir) / "optimizer_evidence.json"
+        evidence = build_optimizer_evidence(
+            args.episode_dir,
+            rollout_result=value,
+        )
+        _write(evidence_path, evidence)
+        value["optimizer_evidence"] = str(evidence_path.resolve())
         _write(args.output, value)
         print(json.dumps(value, ensure_ascii=False, indent=2))
-    elif args.command == "propose":
+    elif args.command == "build-evidence":
+        result = json.loads(Path(args.result).read_text()) if args.result else None
+        value = build_optimizer_evidence(
+            args.episode_dir,
+            rollout_result=result,
+            max_images=args.max_images,
+            max_turns=args.max_turns,
+        )
+        _write(args.output, value)
+        print(json.dumps(value, ensure_ascii=False, indent=2))
+    elif args.command in {"optimize", "propose"}:
+        evidence = _load_many(args.evidence)
         if args.response_file:
-            patch = SkillPatch.model_validate_json(Path(args.response_file).read_text())
-        else:
-            patch = propose_patch(
-                rollout_results=_load_many(args.result),
+            decision = SkillOptimizationDecision.model_validate_json(
+                Path(args.response_file).read_text()
+            )
+            validate_optimizer_decision(
+                decision,
                 memory_dir=rendered_memory_dir(args.library),
+                evidence=evidence,
+                max_patch_lines=args.max_patch_lines,
+                max_patch_new_chars=args.max_patch_new_chars,
+                max_patch_growth_chars=args.max_patch_growth_chars,
+            )
+        else:
+            decision = optimize_skills(
+                evidence=evidence,
+                memory_dir=rendered_memory_dir(args.library),
+                skill_path=args.skill_path,
                 base_url=args.base_url,
                 api_key=args.api_key,
                 model=args.model,
+                output_dir=Path(args.output).parent,
                 max_tokens=args.max_tokens,
+                timeout_s=args.timeout_s,
+                max_patch_lines=args.max_patch_lines,
+                max_patch_new_chars=args.max_patch_new_chars,
+                max_patch_growth_chars=args.max_patch_growth_chars,
             )
-        _write(args.output, patch.model_dump(mode="json"))
-        print(patch.model_dump_json(indent=2))
+        _write(args.output, decision.model_dump(mode="json"))
+        print(decision.model_dump_json(indent=2))
+    elif args.command == "check-optimizer":
+        check_optimizer_service(
+            base_url=args.base_url,
+            api_key=args.api_key,
+            model=args.model,
+            timeout_s=args.timeout_s,
+        )
+        print(json.dumps({"status": "ready", "model": args.model}, indent=2))
     elif args.command == "admit":
         decision = decide_admission(
             correction_parent=_load_many(args.correction_parent),

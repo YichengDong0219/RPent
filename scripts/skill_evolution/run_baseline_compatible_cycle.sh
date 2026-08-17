@@ -8,7 +8,7 @@ set -Eeuo pipefail
 # =============================================================================
 # Quick configuration
 # =============================================================================
-EXPERIMENT_NAME="libero_object_baseline_compatible_case_colle"
+EXPERIMENT_NAME="libero_object_t0_natural_language_optimizer_mvp_v1"
 # Base LIBERO checkout. Standard suites use its assets directly. PRO suites
 # use the installed liberopro assets selected by LIBERO_TYPE while retaining
 # this checkout for the shared LIBERO import surface.
@@ -19,8 +19,6 @@ LIBERO_TYPE="pro"
 # SUITE:TASK syntax and gets an independent S000 -> S001 cycle/output tree.
 EVAL_TASKS=(
   "libero_object_lan:0"
-  "libero_object_lan:1"
-  "libero_object_lan:2"
 )
 # Independent seeds shared by every target above. Keep correction seeds held
 # out from discovery so candidate validation does not reuse proposal evidence.
@@ -35,8 +33,19 @@ PLANNER_MODEL="qwen-vl:Qwen3.5-9B"
 QWEN_BASE_URL="http://114.212.227.193:8000/v1"
 QWEN_API_KEY="EMPTY"
 MAX_TOKENS=4096
-CURATOR_MAX_TOKENS=4096
 MAX_TURNS=40
+
+# Independent stronger multimodal skill optimizer (OpenAI-compatible API).
+SKILL_OPTIMIZER_BASE_URL="http://127.0.0.1:8001/v1"
+SKILL_OPTIMIZER_API_KEY="EMPTY"
+SKILL_OPTIMIZER_MODEL="Qwen3.6-27B"
+SKILL_OPTIMIZER_MAX_TOKENS=8192
+SKILL_OPTIMIZER_TIMEOUT_S=600
+SKILL_OPTIMIZER_MAX_IMAGES_PER_ROLLOUT=6
+SKILL_OPTIMIZER_SKILL_PATH="scripts/skill_evolution/skill_optimizer/SKILL.md"
+MAX_PATCH_LINES=24
+MAX_PATCH_NEW_CHARS=2000
+MAX_PATCH_GROWTH_CHARS=1000
 
 # Pi0.5: same checkpoint, endpoint and unrestricted baseline tool schema.
 PI05_CHECKPOINT="/home/dongyicheng/checkpoints/RLinf-Pi05-LIBERO-130-fullshot-SFT"
@@ -131,6 +140,11 @@ cd "${REPO_ROOT}"
   --base-url "${QWEN_BASE_URL}" \
   --api-key "${QWEN_API_KEY}" \
   --model "${PLANNER_MODEL#qwen-vl:}"
+"${PYTHON_BIN}" -m rpent.evolution.cli check-optimizer \
+  --base-url "${SKILL_OPTIMIZER_BASE_URL}" \
+  --api-key "${SKILL_OPTIMIZER_API_KEY}" \
+  --model "${SKILL_OPTIMIZER_MODEL}" \
+  --timeout-s 60
 
 if [[ "${START_SHARED_VLA}" == "1" ]]; then
   VLA_STDIN_FIFO="${SERVICES_DIR}/vla_stdin.fifo"
@@ -195,9 +209,19 @@ for task_index in "${!EVAL_SUITES[@]}"; do
     --preservation-cases "${PRESERVATION_CASES}" \
     --planner "${PLANNER}" --model "${PLANNER_MODEL}" \
     --qwen-base-url "${QWEN_BASE_URL}" --qwen-api-key "${QWEN_API_KEY}" \
+    --optimizer-base-url "${SKILL_OPTIMIZER_BASE_URL}" \
+    --optimizer-api-key "${SKILL_OPTIMIZER_API_KEY}" \
+    --optimizer-model "${SKILL_OPTIMIZER_MODEL}" \
+    --optimizer-max-tokens "${SKILL_OPTIMIZER_MAX_TOKENS}" \
+    --optimizer-timeout-s "${SKILL_OPTIMIZER_TIMEOUT_S}" \
+    --optimizer-max-images-per-rollout "${SKILL_OPTIMIZER_MAX_IMAGES_PER_ROLLOUT}" \
+    --optimizer-skill-path "${REPO_ROOT}/${SKILL_OPTIMIZER_SKILL_PATH}" \
+    --max-patch-lines "${MAX_PATCH_LINES}" \
+    --max-patch-new-chars "${MAX_PATCH_NEW_CHARS}" \
+    --max-patch-growth-chars "${MAX_PATCH_GROWTH_CHARS}" \
     --vla-endpoint "${VLA_ENDPOINT}" --libero-type "${LIBERO_TYPE}" \
     --cuda-device "${VLA_GPU}" --max-tokens "${MAX_TOKENS}" \
-    --curator-max-tokens "${CURATOR_MAX_TOKENS}" --max-turns "${MAX_TURNS}" \
+    --max-turns "${MAX_TURNS}" \
     --max-episode-steps "${MAX_EPISODE_STEPS}" \
     --hires-retention-steps "${HIRES_RETENTION_STEPS}" \
     --run-timeout-s "${RUN_TIMEOUT_S}" --max-attempts "${MAX_ATTEMPTS}" \

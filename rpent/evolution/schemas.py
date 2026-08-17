@@ -2,45 +2,83 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
-PatchOperation = Literal["add", "replace"]
-PatchField = Literal["activation", "procedure", "termination", "recovery"]
+PatchField = Literal["routing", "activation", "procedure", "termination", "recovery"]
+ProblemType = Literal[
+    "routing",
+    "application",
+    "execution",
+    "recovery",
+    "infrastructure",
+    "insufficient_evidence",
+]
 
 
 class EvidenceRef(BaseModel):
-    """One rollout cited by an offline curator."""
+    """A precise pointer back to optimizer evidence."""
 
     run_id: str
     event_ids: list[int] = Field(default_factory=list)
+    message_indices: list[int] = Field(default_factory=list)
+    image_ids: list[str] = Field(default_factory=list)
     note: str = ""
 
 
 class SkillPatch(BaseModel):
-    """A single-file, single-snippet memory change.
+    """One exact replacement in one natural-language memory file."""
 
-    ``replace`` deliberately uses an exact old snippet.  This keeps the
-    heterogeneous reviewed Markdown intact and makes every candidate diff
-    auditable without teaching the online planner a new skill protocol.
-    """
-
-    schema_version: Literal["SkillPatch/v1"] = "SkillPatch/v1"
+    schema_version: Literal["SkillPatch/v2"] = "SkillPatch/v2"
     patch_id: str
-    operation: PatchOperation
+    operation: Literal["replace"] = "replace"
+    target_skill_id: str
     target: str
     field: PatchField
-    old_text: str = ""
+    old_text: str
     new_text: str
     hypothesis: str
     expected_effect: str
     evidence: list[EvidenceRef] = Field(min_length=2)
 
     @model_validator(mode="after")
-    def validate_operation(self) -> "SkillPatch":
-        if self.operation == "replace" and not self.old_text:
+    def validate_replace(self) -> "SkillPatch":
+        if not self.old_text:
             raise ValueError("replace patches require old_text")
-        if self.operation == "add" and self.old_text:
-            raise ValueError("add patches must not set old_text")
+        if not self.new_text:
+            raise ValueError("replace patches require new_text")
+        if self.old_text == self.new_text:
+            raise ValueError("patch must change the selected snippet")
+        if not self.target_skill_id:
+            raise ValueError("target_skill_id is required")
         return self
+
+
+class SkillOptimizationDecision(BaseModel):
+    """The only accepted output contract for the external optimizer."""
+
+    schema_version: Literal["SkillOptimizationDecision/v1"] = (
+        "SkillOptimizationDecision/v1"
+    )
+    decision: Literal["patch", "no_patch"]
+    problem_type: ProblemType
+    target_skill_id: str | None = None
+    causal_summary: str
+    evidence: list[EvidenceRef] = Field(default_factory=list)
+    patch: SkillPatch | None = None
+
+    @model_validator(mode="after")
+    def validate_decision(self) -> "SkillOptimizationDecision":
+        if self.decision == "patch":
+            if self.patch is None:
+                raise ValueError("patch decision requires patch")
+            if self.target_skill_id != self.patch.target_skill_id:
+                raise ValueError("decision and patch target_skill_id must match")
+        elif self.patch is not None:
+            raise ValueError("no_patch decision must not include patch")
+        return self
+
+
+def optimizer_decision_json_schema() -> dict[str, Any]:
+    return SkillOptimizationDecision.model_json_schema()
