@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import json
 import base64
+import json
 from pathlib import Path
 
 import numpy as np
@@ -11,8 +11,11 @@ from robots.libero.env_client import LiberoEnvClient
 from rpent.evolution.admission import decide_admission
 from rpent.evolution.evidence import build_optimizer_evidence
 from rpent.evolution.library import apply_patch, create_snapshot
-from rpent.evolution.optimizer import InvalidPatchError, validate_optimizer_decision
-from rpent.evolution.optimizer import optimize_skills
+from rpent.evolution.optimizer import (
+    InvalidPatchError,
+    optimize_skills,
+    validate_optimizer_decision,
+)
 from rpent.evolution.schemas import SkillOptimizationDecision, SkillPatch
 from rpent.tools.toolkit import Toolkit
 
@@ -230,6 +233,15 @@ def test_memory_patch_contract(tmp_path: Path) -> None:
     )
     with pytest.raises(InvalidPatchError, match="routing"):
         validate_optimizer_decision(invalid, memory_dir=memory, evidence=evidence)
+    unsafe_new_text = decision.model_copy(
+        update={
+            "patch": decision.patch.model_copy(
+                update={"new_text": "- replacement without the target link\n## injected"}
+            )
+        }
+    )
+    with pytest.raises(InvalidPatchError, match="new_text"):
+        validate_optimizer_decision(unsafe_new_text, memory_dir=memory, evidence=evidence)
 
 
 def test_optimizer_multimodal_request_and_one_repair(
@@ -261,6 +273,9 @@ def test_optimizer_multimodal_request_and_one_repair(
     def fake_post(url: str, key: str, body: dict, timeout_s: int) -> dict:
         calls.append(body)
         if len(calls) == 1:
+            payload = json.loads(body["messages"][1]["content"][0]["text"])
+            assert "current_proposal_evidence" in payload
+            assert payload["historical_feedback"]["previous_cycle_pairs"][0]["candidate_library"] == "rejected-candidate"
             assert any(
                 block.get("type") == "image_url" and block["image_url"]["url"].startswith("data:image/png;base64,")
                 for block in body["messages"][1]["content"]
@@ -281,6 +296,13 @@ def test_optimizer_multimodal_request_and_one_repair(
     output = tmp_path / "optimizer"
     decision = optimize_skills(
         evidence=evidence,
+        historical_feedback={
+            "schema_version": "OptimizerFeedbackContext/v1",
+            "patch_history": [],
+            "unresolved_regressions": [],
+            "recent_strict_gains": [],
+            "previous_cycle_pairs": [{"candidate_library": "rejected-candidate"}],
+        },
         memory_dir=memory,
         skill_path=skill_path,
         base_url="http://optimizer/v1",

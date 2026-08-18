@@ -6,14 +6,19 @@ import base64
 import json
 import mimetypes
 import re
+import struct
 import urllib.error
 import urllib.request
+import zlib
 from pathlib import Path
 from typing import Any
 
 from pydantic import ValidationError
 
-from rpent.evolution.schemas import SkillOptimizationDecision, optimizer_decision_json_schema
+from rpent.evolution.schemas import (
+    SkillOptimizationDecision,
+    optimizer_decision_json_schema,
+)
 
 KNOWN_TOOLS = {
     "read_text_file", "write_text_file", "list_dir", "read_image",
@@ -77,6 +82,28 @@ def _data_url(path: Path) -> str:
     return f"data:{mime};base64,{base64.b64encode(path.read_bytes()).decode()}"
 
 
+def _red_png_data_url(size: int = 64) -> str:
+    """Create a valid dependency-free solid-red RGB PNG for service checks."""
+    signature = b"\x89PNG\r\n\x1a\n"
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        payload = kind + data
+        return (
+            struct.pack(">I", len(data))
+            + payload
+            + struct.pack(">I", zlib.crc32(payload) & 0xFFFFFFFF)
+        )
+
+    row = b"\x00" + (b"\xff\x00\x00" * size)
+    png = (
+        signature
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(row * size))
+        + chunk(b"IEND", b"")
+    )
+    return f"data:image/png;base64,{base64.b64encode(png).decode('ascii')}"
+
+
 def _source_files(memory_dir: Path, evidence: list[dict[str, Any]]) -> dict[str, str]:
     files = {"MEMORY.md": (memory_dir / "MEMORY.md").read_text()}
     ids = {
@@ -104,6 +131,8 @@ def validate_optimizer_decision(
 ) -> None:
     if decision.decision == "no_patch":
         return
+    if decision.problem_type in {"infrastructure", "insufficient_evidence"}:
+        raise InvalidPatchError(f"{decision.problem_type} decisions may not include a patch")
     assert decision.patch is not None
     patch = decision.patch
     root = Path(memory_dir).resolve()
@@ -166,6 +195,16 @@ def validate_optimizer_decision(
             raise InvalidPatchError("MEMORY routing old_text must be exactly one index bullet")
         if f"({patch.target_skill_id}.md)" not in patch.old_text:
             raise InvalidPatchError("MEMORY bullet must link to target_skill_id")
+        if (
+            patch.new_text != patch.new_text.strip("\n")
+            or "\n" in patch.new_text
+            or not patch.new_text.lstrip().startswith("-")
+            or f"({patch.target_skill_id}.md)" not in patch.new_text
+            or patch.new_text.lstrip().startswith(("- #", "- ```", "- <"))
+        ):
+            raise InvalidPatchError(
+                "MEMORY routing new_text must remain one bullet with the same target link"
+            )
         location = source.index(patch.old_text)
         before = source[:location]
         last_header = next((line for line in reversed(before.splitlines()) if line.startswith("## ")), "")
@@ -203,6 +242,7 @@ def optimize_skills(
     api_key: str,
     model: str,
     output_dir: str | Path,
+    historical_feedback: dict[str, Any] | None = None,
     max_tokens: int = 8192,
     timeout_s: int = 600,
     max_patch_lines: int = 24,
@@ -223,8 +263,15 @@ def optimize_skills(
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
     payload = {
-        "task": "Diagnose the batch and return one SkillOptimizationDecision/v1.",
-        "evidence": evidence,
+        "task": "Diagnose the current proposal window and return one SkillOptimizationDecision/v1.",
+        "current_proposal_evidence": evidence,
+        "historical_feedback": historical_feedback or {
+            "schema_version": "OptimizerFeedbackContext/v1",
+            "patch_history": [],
+            "unresolved_regressions": [],
+            "recent_strict_gains": [],
+            "previous_cycle_pairs": [],
+        },
         "editable_source_files": sources,
         "output_schema": optimizer_decision_json_schema(),
         "patch_limits": {
@@ -248,6 +295,25 @@ def optimize_skills(
             image_manifest.append({**label, "path": str(path.resolve())})
             user_content.append({"type": "text", "text": "VISUAL_EVIDENCE " + json.dumps(label, ensure_ascii=False)})
             user_content.append({"type": "image_url", "image_url": {"url": _data_url(path)}})
+    feedback_images = [str(item["path"]) for item in image_manifest]
+    for group in ("unresolved_regressions", "recent_strict_gains"):
+        for item in (historical_feedback or {}).get(group, []):
+            for side in ("parent_images", "candidate_images"):
+                for value in (item.get("provenance", {}).get(side, [])[:1]):
+                    path = Path(str(value.get("path", "")))
+                    if not path.is_file() or str(path.resolve()) in feedback_images:
+                        continue
+                    feedback_images.append(str(path.resolve()))
+                    label = {
+                        "source": "historical_feedback",
+                        "feedback_case_id": item.get("case_id"),
+                        "pair_class": item.get("pair_class"),
+                        "side": side,
+                        **{key: value.get(key) for key in ("image_id", "role", "camera", "step", "source_event_id")},
+                    }
+                    image_manifest.append({**label, "path": str(path.resolve())})
+                    user_content.append({"type": "text", "text": "HISTORICAL_VISUAL_EVIDENCE " + json.dumps(label, ensure_ascii=False)})
+                    user_content.append({"type": "image_url", "image_url": {"url": _data_url(path)}})
     (output / "image_manifest.json").write_text(json.dumps(image_manifest, ensure_ascii=False, indent=2) + "\n")
     manifest = {
         "endpoint": base_url.rstrip("/") + "/chat/completions",
@@ -256,6 +322,10 @@ def optimize_skills(
         "max_tokens": max_tokens,
         "skill_path": str(Path(skill_path).resolve()),
         "rollout_ids": [x.get("identity", {}).get("run_id") for x in evidence],
+        "feedback_counts": {
+            key: len((historical_feedback or {}).get(key, []))
+            for key in ("patch_history", "unresolved_regressions", "recent_strict_gains", "previous_cycle_pairs")
+        },
         "image_labels": [{k: x.get(k) for k in x if k != "path"} for x in image_manifest],
         "api_key_stored": False,
         "base64_stored": False,
@@ -318,16 +388,15 @@ def check_optimizer_service(*, base_url: str, api_key: str, model: str, timeout_
             json.loads(response.read())
     except Exception as exc:
         raise OptimizerInfrastructureError(f"optimizer models endpoint failed: {exc}") from exc
-    # One-pixel PNG; validates image input and JSON output without tool calling.
-    red = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Z9WQAAAAASUVORK5CYII="
+    # Validate image input and JSON output without tool calling.
     body = {
         "model": model,
         "messages": [{"role": "user", "content": [
             {"type": "text", "text": "Return exactly one JSON object with key status and value ready."},
-            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{red}"}},
+            {"type": "image_url", "image_url": {"url": _red_png_data_url()}},
         ]}],
         "temperature": 0,
-        "max_tokens": 128,
+        "max_tokens": 512,
         "response_format": {"type": "json_object"},
     }
     response = _post_json(base_url.rstrip("/") + "/chat/completions", api_key, body, timeout_s)

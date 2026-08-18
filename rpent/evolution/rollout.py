@@ -82,6 +82,7 @@ def summarize_rollout(
     states = _load_json(root / "states.json", [])
     states = [state for state in states if isinstance(state, dict)] if isinstance(states, list) else []
     transcript = _last_transcript(root)
+    stats = transcript.get("stats", {}) if isinstance(transcript.get("stats"), dict) else {}
     activated, compact_events, event_count = _trace_summary(
         root / "evolution_trace.jsonl"
     )
@@ -108,6 +109,10 @@ def summarize_rollout(
         "process_exit_code": process_exit_code,
         "agent_error": agent_error,
         "planner_finish": transcript.get("finish"),
+        "planner_turns": stats.get("turns_used"),
+        "planner_tool_calls": stats.get("tool_calls"),
+        "planner_input_tokens": stats.get("total_input_tokens"),
+        "planner_output_tokens": stats.get("total_output_tokens"),
         "activated_skill_ids": activated,
         "trace_event_count": event_count,
         "compact_events": compact_events,

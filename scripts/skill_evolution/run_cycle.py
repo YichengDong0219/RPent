@@ -183,9 +183,12 @@ def _run_case(
     run_root = args.experiment_dir / "rollouts" / cycle_name / phase / role / case_id
     result_path = run_root / "result.json"
     if result_path.is_file():
-        return json.loads(result_path.read_text())
+        cached = json.loads(result_path.read_text())
+        if cached.get("status") in VALID_STATUSES:
+            return cached
     last_result: dict[str, Any] | None = None
-    for attempt in range(1, args.max_attempts + 1):
+    existing_attempts = len(list((run_root / "attempts").glob("attempt_[0-9][0-9]")))
+    for attempt in range(existing_attempts + 1, existing_attempts + args.max_attempts + 1):
         attempt_dir = run_root / "attempts" / f"attempt_{attempt:02d}"
         attempt_dir.mkdir(parents=True, exist_ok=True)
         command = [
@@ -258,6 +261,7 @@ def _run_case(
                 "seed": seed,
                 "attempt": attempt,
                 "vla_endpoint": args.vla_endpoint,
+                "result_path": str(result_path),
             }
         )
         _write_json(attempt_dir / "result.json", last_result)

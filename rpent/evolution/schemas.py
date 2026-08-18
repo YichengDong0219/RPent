@@ -15,6 +15,14 @@ ProblemType = Literal[
     "infrastructure",
     "insufficient_evidence",
 ]
+WindowPhase = Literal["proposal", "forward", "retention"]
+PairClass = Literal[
+    "success_gain",
+    "efficiency_gain",
+    "regression",
+    "unresolved_failure",
+    "stable_success",
+]
 
 
 class EvidenceRef(BaseModel):
@@ -78,6 +86,58 @@ class SkillOptimizationDecision(BaseModel):
         elif self.patch is not None:
             raise ValueError("no_patch decision must not include patch")
         return self
+
+
+class PairedCaseSide(BaseModel):
+    """One side of a parent/candidate physical replay pair."""
+
+    library: str
+    status: str
+    benchmark_success: bool
+    planner_turns: int | None = None
+    target_skill_active: bool = False
+    activated_skill_ids: list[str] = Field(default_factory=list)
+    safety_violations: list[str] = Field(default_factory=list)
+    optimizer_evidence: str | None = None
+    episode_dir: str | None = None
+
+
+class PairedCaseFeedback(BaseModel):
+    """Auditable comparison used by admission and the next optimizer turn."""
+
+    schema_version: Literal["PairedCaseFeedback/v1"] = "PairedCaseFeedback/v1"
+    cycle: str
+    phase: WindowPhase
+    case_id: str
+    suite: str
+    task: int
+    seed: int
+    patch_id: str
+    patch: dict[str, Any]
+    target_skill_id: str
+    parent: PairedCaseSide
+    candidate: PairedCaseSide
+    pair_class: PairClass
+    strict_improvement: bool = False
+    action_divergence: dict[str, Any] = Field(default_factory=dict)
+    provenance: dict[str, Any] = Field(default_factory=dict)
+    resolved: bool = False
+
+
+class EvolutionWindowState(BaseModel):
+    """Mutable checkpoint for one task-local sliding evolution stream."""
+
+    schema_version: Literal["EvolutionWindowState/v1"] = "EvolutionWindowState/v1"
+    suite: str
+    task: int
+    parent_library_id: str = "S000"
+    seed_cursor: int = 0
+    retention_cursor: int = 0
+    consecutive_no_gain: int = 0
+    consecutive_invalid: int = 0
+    active_cycle: str | None = None
+    status: Literal["active", "pending", "stalled", "optimizer_stalled", "scope_exhausted"] = "active"
+    proposal_sources: list[str] = Field(default_factory=list)
 
 
 def optimizer_decision_json_schema() -> dict[str, Any]:

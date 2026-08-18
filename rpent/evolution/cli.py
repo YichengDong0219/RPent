@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from rpent.evolution.admission import decide_admission
+from rpent.evolution.admission import decide_admission, decide_windowed_admission
 from rpent.evolution.evidence import build_optimizer_evidence
 from rpent.evolution.library import (
     apply_patch,
@@ -15,12 +15,12 @@ from rpent.evolution.library import (
     load_manifest,
     rendered_memory_dir,
 )
-from rpent.evolution.rollout import summarize_rollout
 from rpent.evolution.optimizer import (
     check_optimizer_service,
     optimize_skills,
     validate_optimizer_decision,
 )
+from rpent.evolution.rollout import summarize_rollout
 from rpent.evolution.schemas import SkillOptimizationDecision
 
 
@@ -100,6 +100,11 @@ def _parser() -> argparse.ArgumentParser:
     admit.add_argument("--target-skill-id", required=True)
     admit.add_argument("--minimum-activations", type=int, default=2)
     admit.add_argument("--output", required=True)
+
+    windowed = sub.add_parser("admit-windowed")
+    windowed.add_argument("--feedback", action="append", required=True)
+    windowed.add_argument("--minimum-activations", type=int, default=2)
+    windowed.add_argument("--output", required=True)
     return parser
 
 
@@ -186,6 +191,13 @@ def main() -> int:
             preservation_parent=_load_many(args.preservation_parent),
             preservation_candidate=_load_many(args.preservation_candidate),
             target_skill_id=args.target_skill_id,
+            minimum_activations=args.minimum_activations,
+        )
+        _write(args.output, decision.to_dict())
+        print(json.dumps(decision.to_dict(), ensure_ascii=False, indent=2))
+    elif args.command == "admit-windowed":
+        decision = decide_windowed_admission(
+            _load_many(args.feedback),
             minimum_activations=args.minimum_activations,
         )
         _write(args.output, decision.to_dict())

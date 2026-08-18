@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Any, Literal
 
+from rpent.evolution.schemas import PairedCaseFeedback
+
 Decision = Literal["accepted", "rejected", "pending"]
 INFRA_STATUSES = {
     "timeout",
@@ -99,4 +101,96 @@ def decide_admission(
         candidate_successes,
         regressions,
         activations,
+    )
+
+
+@dataclass(frozen=True)
+class WindowedAdmissionDecision:
+    """Dominance decision across proposal, forward, and retention windows."""
+
+    decision: Decision
+    outcome: str
+    reasons: list[str]
+    window_summaries: dict[str, dict[str, int]]
+    regressions: list[str]
+    strict_improvements: list[dict[str, Any]]
+    candidate_activations: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"schema_version": "WindowedAdmissionDecision/v1", **asdict(self)}
+
+
+def decide_windowed_admission(
+    feedback: list[PairedCaseFeedback | dict[str, Any]],
+    *,
+    minimum_activations: int = 2,
+) -> WindowedAdmissionDecision:
+    """Require per-case success dominance and at least one attributed gain."""
+
+    pairs = [
+        item if isinstance(item, PairedCaseFeedback) else PairedCaseFeedback.model_validate(item)
+        for item in feedback
+    ]
+    if not pairs:
+        raise ValueError("windowed admission requires paired feedback")
+    summaries: dict[str, dict[str, int]] = {}
+    for phase in ("proposal", "forward", "retention"):
+        phase_pairs = [item for item in pairs if item.phase == phase]
+        summaries[phase] = {
+            "cases": len(phase_pairs),
+            "parent_successes": sum(item.parent.benchmark_success for item in phase_pairs),
+            "candidate_successes": sum(item.candidate.benchmark_success for item in phase_pairs),
+        }
+    if any(
+        item.parent.status in INFRA_STATUSES or item.candidate.status in INFRA_STATUSES
+        for item in pairs
+    ):
+        return WindowedAdmissionDecision(
+            "pending", "pending_infrastructure", ["infrastructure_or_agent_error"],
+            summaries, [], [], 0,
+        )
+    safety = any(
+        value
+        for item in pairs
+        for value in (item.parent.safety_violations, item.candidate.safety_violations)
+    )
+    regressions = [item.case_id for item in pairs if item.pair_class == "regression"]
+    improvements = [
+        {
+            "phase": item.phase,
+            "case_id": item.case_id,
+            "kind": item.pair_class,
+            "parent_turns": item.parent.planner_turns,
+            "candidate_turns": item.candidate.planner_turns,
+        }
+        for item in pairs
+        if item.strict_improvement
+    ]
+    activations = sum(item.candidate.target_skill_active for item in pairs)
+    reasons: list[str] = []
+    if regressions:
+        reasons.append("success_regression")
+    if not improvements:
+        reasons.append("no_strict_gain")
+    if activations < minimum_activations:
+        reasons.append("insufficient_candidate_activation")
+    if safety:
+        reasons.append("safety_violation")
+    if reasons:
+        outcome = (
+            "rejected_success_regression"
+            if regressions else "rejected_no_strict_gain"
+            if "no_strict_gain" in reasons else "rejected_protocol"
+        )
+        return WindowedAdmissionDecision(
+            "rejected", outcome, reasons, summaries, regressions, improvements, activations
+        )
+    outcome = (
+        "accepted_success_gain"
+        if any(item["kind"] == "success_gain" for item in improvements)
+        else "accepted_turn_efficiency"
+    )
+    return WindowedAdmissionDecision(
+        "accepted", outcome, ["all_dominance_gates_passed"], summaries,
+        regressions, improvements, activations,
     )

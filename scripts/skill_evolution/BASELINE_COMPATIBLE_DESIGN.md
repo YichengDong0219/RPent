@@ -25,12 +25,13 @@ reviewed resources/libero/memory
   -> baseline planner reads resources/libero/memory/*
   -> runtime transparently serves S000/rendered_memory/*
   -> passive trace: memory read -> tool call/result -> official outcome
-  -> OptimizerEvidence/v1 (seeds 0-2; structured trace, no console parsing)
+  -> proposal window OptimizerEvidence/v1 (structured trace, no console parsing)
   -> independent stronger multimodal skill optimizer
   -> no_patch or one exact MEMORY-index/leaf snippet patch
   -> candidate complete rendered-memory snapshot
-  -> paired correction replay: parent vs candidate (seeds 3-5)
-  -> paired preservation replay on baseline-proven cases
+  -> paired proposal replay on the same seeds
+  -> paired forward replay on the next unseen seed window
+  -> paired retention replay from historical successes/regressions
   -> accepted / rejected / pending
   -> accepted only: materialize next immutable libraries/SNNN
 ```
@@ -63,9 +64,16 @@ OpenAI-compatible 多模态服务。每条 rollout 从 `evolution_trace.jsonl`�
 `states.json` 和最多六张精选图片生成 `optimizer_evidence.json`；thinking 与
 `console.log` 不进入 optimizer 输入。
 
-接纳条件：correction 成功数比 parent 至少增加 1、parent-success preservation case
-零退化、目标 skill 在 candidate correction 中至少激活 2 次、无安全违规。运行或
-planner 基础设施错误得到 `pending`，不被算作候选失败。
+接纳条件使用逐 case dominance：proposal、forward 和 retention 中所有 parent-success
+case 都必须由 candidate 保持成功；三个窗口合计至少出现一个与目标 leaf 归因的
+failure→success，或双方均成功且 candidate planner turn 至少少 1。目标 skill 在全部
+candidate replay 中至少激活 2 次，且不得出现安全违规。运行或 planner 基础设施错误得到
+`pending`，不被算作候选失败。
+
+每个 task 保存 `EvolutionWindowState/v1`、append-only paired/patch history 和动态 retention
+archive。forward 的正式一侧成为下一轮 proposal：candidate 接纳时选 candidate，否则选
+parent。Retention 优先 replay 尚未解决的 regression，再对历史成功 case round-robin。
+当前 candidate 的比较结果只进入下一轮 optimizer，避免验证信息泄漏回当前 proposal。
 
 ## 运行
 
@@ -75,11 +83,11 @@ planner 基础设施错误得到 `pending`，不被算作候选失败。
 bash scripts/skill_evolution/run_baseline_compatible_cycle.sh
 ```
 
-脚本快速配置区暴露 suite/task、discovery/correction seeds、preservation cases、Qwen
+脚本快速配置区暴露 suite/task、seed 范围、proposal/forward/retention 窗口与 stride、Qwen
 模型和服务地址、独立 optimizer 的 URL/key/model/token/timeout/图片及 patch budget、
-Pi0.5 checkpoint、GPU、VLA endpoint、token/turn/episode budget。每次启动只创建一个
-新 `cycle_NNN`；它从编号最大的 accepted `libraries/SNNN` 开始。rejected candidate 和
-旧 cycle 永不覆盖。
+Pi0.5 checkpoint、GPU、VLA endpoint、token/turn/episode budget。每次启动默认最多推进
+三个 `cycle_NNN`，并始终从编号最大的 accepted `libraries/SNNN` 开始。rejected candidate
+和旧 cycle 永不覆盖；pending cycle 在下次启动时恢复。
 
 首次正式 evolve 前应先做 A/A 检查：同一组 baseline case 分别使用原始 MEMORY 与
 `S000` memory view。二者允许存在模型采样和物理仿真的随机波动，但不应出现工具缺失、
@@ -89,6 +97,6 @@ VLA horizon 改变、prompt 缺失或系统性动作模式变化。
 
 - 连续 control-step 级 VLA 蒸馏数据与训练；
 - 视觉状态到具体 skill step 的强因果对齐；
-- 自动挑选三个语义不同且已由 baseline 验证成功的 preservation cases；当前由脚本
-  明确配置，避免系统悄悄使用失败 case；
-- 自动从 baseline 结果库挑选 preservation cases；当前仍由脚本明确配置。
+- 跨 task-family retention、局部 skill branch merge 与全局 consolidation；当前 archive
+  只覆盖单 suite/task scope；
+- 多次重复 rollout 的统计显著性；当前每个 parent/candidate case 只取一次有效结果。

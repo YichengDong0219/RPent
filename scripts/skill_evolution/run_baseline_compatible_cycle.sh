@@ -8,7 +8,7 @@ set -Eeuo pipefail
 # =============================================================================
 # Quick configuration
 # =============================================================================
-EXPERIMENT_NAME="libero_object_t0_natural_language_optimizer_mvp_v1"
+EXPERIMENT_NAME="libero_object_t0_sliding_window_evolution_v1"
 # Base LIBERO checkout. Standard suites use its assets directly. PRO suites
 # use the installed liberopro assets selected by LIBERO_TYPE while retaining
 # this checkout for the shared LIBERO import surface.
@@ -20,12 +20,20 @@ LIBERO_TYPE="pro"
 EVAL_TASKS=(
   "libero_object_lan:0"
 )
-# Independent seeds shared by every target above. Keep correction seeds held
-# out from discovery so candidate validation does not reuse proposal evidence.
-DISCOVERY_SEEDS="0,1,2"
-CORRECTION_SEEDS="3,4,5"
-# Use three baseline-proven cases; syntax is SUITE:TASK:SEED separated by ';'.
-PRESERVATION_CASES="libero_spatial_swap:8:0;libero_object_swap:6:0;libero_object_task:0:0;libero_object_object:1:0"
+# Sliding task-local evolution stream. Proposal and forward windows advance by
+# SEED_STRIDE; retention is selected automatically from historical successes
+# and unresolved regressions in this task's archive.
+SEED_START=0
+SEED_STOP_EXCLUSIVE=50
+PROPOSAL_WINDOW_SIZE=3
+FORWARD_WINDOW_SIZE=3
+SEED_STRIDE=3
+RETENTION_WINDOW_SIZE=4
+MAX_CYCLES_PER_RUN=1
+MAX_CONSECUTIVE_NO_GAIN=3
+PLANNER_TURN_IMPROVEMENT=1
+MINIMUM_ACTIVATIONS=2
+RESET_STALLED=0
 
 # Execution planner (same values as the baseline experiment).
 PLANNER="api"
@@ -198,15 +206,23 @@ for task_index in "${!EVAL_SUITES[@]}"; do
   echo "[skill-evolve] task output: ${eval_task_dir}"
 
   task_exit_code=0
-  "${PYTHON_BIN}" scripts/skill_evolution/run_cycle.py \
+  stream_args=(
+    "${PYTHON_BIN}" scripts/skill_evolution/run_stream.py
     --repo-root "${REPO_ROOT}" \
     --libero-root "${LIBERO_CHECKOUT}" \
     --experiment-dir "${eval_task_dir}" \
     --memory-dir "${REPO_ROOT}/resources/libero/memory" \
     --suite "${eval_suite}" --task "${eval_task_id}" \
-    --discovery-seeds "${DISCOVERY_SEEDS}" \
-    --correction-seeds "${CORRECTION_SEEDS}" \
-    --preservation-cases "${PRESERVATION_CASES}" \
+    --seed-start "${SEED_START}" \
+    --seed-stop-exclusive "${SEED_STOP_EXCLUSIVE}" \
+    --proposal-window-size "${PROPOSAL_WINDOW_SIZE}" \
+    --forward-window-size "${FORWARD_WINDOW_SIZE}" \
+    --seed-stride "${SEED_STRIDE}" \
+    --retention-window-size "${RETENTION_WINDOW_SIZE}" \
+    --max-cycles-per-run "${MAX_CYCLES_PER_RUN}" \
+    --max-consecutive-no-gain "${MAX_CONSECUTIVE_NO_GAIN}" \
+    --planner-turn-improvement "${PLANNER_TURN_IMPROVEMENT}" \
+    --minimum-activations "${MINIMUM_ACTIVATIONS}" \
     --planner "${PLANNER}" --model "${PLANNER_MODEL}" \
     --qwen-base-url "${QWEN_BASE_URL}" --qwen-api-key "${QWEN_API_KEY}" \
     --optimizer-base-url "${SKILL_OPTIMIZER_BASE_URL}" \
@@ -225,7 +241,12 @@ for task_index in "${!EVAL_SUITES[@]}"; do
     --max-episode-steps "${MAX_EPISODE_STEPS}" \
     --hires-retention-steps "${HIRES_RETENTION_STEPS}" \
     --run-timeout-s "${RUN_TIMEOUT_S}" --max-attempts "${MAX_ATTEMPTS}" \
-    --python "${PYTHON_BIN}" || task_exit_code=$?
+    --python "${PYTHON_BIN}"
+  )
+  if [[ "${RESET_STALLED}" == "1" ]]; then
+    stream_args+=(--reset-stalled)
+  fi
+  "${stream_args[@]}" || task_exit_code=$?
 
   TASK_EXIT_CODES+=("${task_exit_code}")
   if (( task_exit_code != 0 )); then
