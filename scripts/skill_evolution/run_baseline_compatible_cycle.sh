@@ -25,7 +25,7 @@ EVAL_TASKS=(
 DISCOVERY_SEEDS="0,1,2"
 CORRECTION_SEEDS="3,4,5"
 # Use three baseline-proven cases; syntax is SUITE:TASK:SEED separated by ';'.
-PRESERVATION_CASES="libero_spatial_swap:8:0;libero_object_swap:0:0;libero_object_task:6:0"
+PRESERVATION_CASES="libero_spatial_swap:8:0;libero_object_swap:6:0;libero_object_task:0:0;libero_object_object:1:0"
 
 # Execution planner (same values as the baseline experiment).
 PLANNER="api"
@@ -36,9 +36,9 @@ MAX_TOKENS=4096
 MAX_TURNS=40
 
 # Independent stronger multimodal skill optimizer (OpenAI-compatible API).
-SKILL_OPTIMIZER_BASE_URL="http://127.0.0.1:8001/v1"
+SKILL_OPTIMIZER_BASE_URL="http://114.212.227.193:8000/v1"
 SKILL_OPTIMIZER_API_KEY="EMPTY"
-SKILL_OPTIMIZER_MODEL="Qwen3.6-27B"
+SKILL_OPTIMIZER_MODEL="Qwen3.5-9B"
 SKILL_OPTIMIZER_MAX_TOKENS=8192
 SKILL_OPTIMIZER_TIMEOUT_S=600
 SKILL_OPTIMIZER_MAX_IMAGES_PER_ROLLOUT=6
@@ -62,7 +62,7 @@ CONDA_ENV="rpent"
 MAX_EPISODE_STEPS=10000
 HIRES_RETENTION_STEPS=5
 RUN_TIMEOUT_S=3600
-MAX_ATTEMPTS=2
+MAX_ATTEMPTS=3
 OUTPUT_ROOT="/home/dongyicheng/rpent/logs/skill_evolution"
 # =============================================================================
 
