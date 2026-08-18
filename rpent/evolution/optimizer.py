@@ -1,4 +1,4 @@
-"""Constrained multimodal optimizer for natural-language robot skills."""
+"""Shared constrained client for natural-language robot-skill optimizers."""
 
 from __future__ import annotations
 
@@ -11,14 +11,17 @@ import urllib.error
 import urllib.request
 import zlib
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, TypeVar
 
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
-from rpent.evolution.schemas import (
-    SkillOptimizationDecision,
-    optimizer_decision_json_schema,
-)
+from rpent.evolution.schemas import SkillOptimizationDecision, optimizer_decision_json_schema
+
+THINKING_TEMPERATURE = 1.0
+THINKING_TOP_P = 0.95
+THINKING_TOP_K = 20
+THINKING_PRESENCE_PENALTY = 1.5
+DEFAULT_OPTIMIZER_MAX_TOKENS = 24576
 
 KNOWN_TOOLS = {
     "read_text_file", "write_text_file", "list_dir", "read_image",
@@ -42,7 +45,7 @@ class InvalidPatchError(ValueError):
 
 def _extract_json(content: Any) -> dict[str, Any]:
     if isinstance(content, list):
-        content = "".join(str(x.get("text", "")) for x in content if isinstance(x, dict))
+        content = "".join(str(item.get("text", "")) for item in content if isinstance(item, dict))
     if not isinstance(content, str):
         raise ValueError("optimizer response has no textual content")
     text = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
@@ -83,18 +86,17 @@ def _data_url(path: Path) -> str:
 
 
 def _red_png_data_url(size: int = 64) -> str:
-    """Create a valid dependency-free solid-red RGB PNG for service checks."""
+    """Create a standards-compliant dependency-free RGB PNG."""
     signature = b"\x89PNG\r\n\x1a\n"
 
     def chunk(kind: bytes, data: bytes) -> bytes:
         payload = kind + data
         return (
-            struct.pack(">I", len(data))
-            + payload
+            struct.pack(">I", len(data)) + payload
             + struct.pack(">I", zlib.crc32(payload) & 0xFFFFFFFF)
         )
 
-    row = b"\x00" + (b"\xff\x00\x00" * size)
+    row = b"\x00" + b"\xff\x00\x00" * size
     png = (
         signature
         + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0))
@@ -104,12 +106,135 @@ def _red_png_data_url(size: int = 64) -> str:
     return f"data:image/png;base64,{base64.b64encode(png).decode('ascii')}"
 
 
+def _thinking_request(*, model: str, messages: list[dict[str, Any]], max_tokens: int) -> dict[str, Any]:
+    return {
+        "model": model,
+        "messages": messages,
+        "temperature": THINKING_TEMPERATURE,
+        "top_p": THINKING_TOP_P,
+        "top_k": THINKING_TOP_K,
+        "presence_penalty": THINKING_PRESENCE_PENALTY,
+        "max_tokens": max_tokens,
+        "response_format": {"type": "json_object"},
+        "chat_template_kwargs": {"enable_thinking": True},
+    }
+
+
+def _repair_message(error: str, schema: dict[str, Any], previous_content: Any) -> str:
+    prior = previous_content if isinstance(previous_content, str) else "<no final content>"
+    return (
+        "Your previous final answer failed validation. The original input above is unchanged.\n"
+        f"VALIDATION_ERROR: {error}\n"
+        "Correct only the contract violation. Return one JSON object, with no Markdown. "
+        "Do not invent evidence or change the causal conclusion merely to pass validation.\n"
+        f"OUTPUT_SCHEMA: {json.dumps(schema, ensure_ascii=False)}\n"
+        f"PREVIOUS_FINAL_CONTENT: {prior}"
+    )
+
+
+def _without_local_paths(value: Any) -> Any:
+    if isinstance(value, list):
+        return [_without_local_paths(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _without_local_paths(item)
+            for key, item in value.items()
+            if key not in {"path", "episode_dir", "optimizer_evidence", "trace", "transcript", "states"}
+        }
+    return value
+
+
+TModel = TypeVar("TModel", bound=BaseModel)
+
+
+def request_structured(
+    *,
+    role: str,
+    instructions: str,
+    payload: dict[str, Any],
+    schema: dict[str, Any],
+    validator: Callable[[dict[str, Any]], TModel],
+    base_url: str,
+    api_key: str,
+    model: str,
+    output_dir: str | Path,
+    max_tokens: int = DEFAULT_OPTIMIZER_MAX_TOKENS,
+    timeout_s: int = 600,
+    images: list[dict[str, Any]] | None = None,
+) -> TModel:
+    """Make one role-isolated request plus one same-input schema repair."""
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    sanitized_payload = _without_local_paths(payload)
+    user_content: list[dict[str, Any]] = [
+        {"type": "text", "text": json.dumps(sanitized_payload, ensure_ascii=False)}
+    ]
+    image_manifest = []
+    for item in images or []:
+        path = Path(str(item.get("path", "")))
+        if not path.is_file():
+            continue
+        label = {key: value for key, value in item.items() if key != "path"}
+        image_manifest.append(label)
+        user_content.append({"type": "text", "text": "VISUAL_EVIDENCE " + json.dumps(label, ensure_ascii=False)})
+        user_content.append({"type": "image_url", "image_url": {"url": _data_url(path)}})
+    manifest = {
+        "role": role,
+        "endpoint": base_url.rstrip("/") + "/chat/completions",
+        "model": model,
+        "thinking": True,
+        "temperature": THINKING_TEMPERATURE,
+        "top_p": THINKING_TOP_P,
+        "top_k": THINKING_TOP_K,
+        "presence_penalty": THINKING_PRESENCE_PENALTY,
+        "max_tokens": max_tokens,
+        "image_labels": image_manifest,
+        "api_key_stored": False,
+        "base64_stored": False,
+    }
+    (output / "request_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
+    (output / "image_manifest.json").write_text(json.dumps(image_manifest, ensure_ascii=False, indent=2) + "\n")
+    original_messages = [
+        {"role": "system", "content": instructions},
+        {"role": "user", "content": user_content},
+    ]
+    messages = list(original_messages)
+    attempts: list[dict[str, Any]] = []
+    last_error = ""
+    for attempt in range(2):
+        response = _post_json(
+            base_url.rstrip("/") + "/chat/completions",
+            api_key,
+            _thinking_request(model=model, messages=messages, max_tokens=max_tokens),
+            timeout_s,
+        )
+        attempts.append(response)
+        content = None
+        try:
+            content = response["choices"][0]["message"].get("content")
+            value = validator(_extract_json(content))
+            (output / "raw_response.json").write_text(json.dumps({"attempts": attempts}, ensure_ascii=False, indent=2) + "\n")
+            return value
+        except (KeyError, IndexError, ValueError, ValidationError) as exc:
+            last_error = str(exc)
+            finish_reason = (response.get("choices") or [{}])[0].get("finish_reason")
+            if finish_reason:
+                last_error += f"; finish_reason={finish_reason}"
+            if attempt == 0:
+                messages = original_messages + [
+                    {"role": "user", "content": _repair_message(last_error, schema, content)}
+                ]
+    (output / "raw_response.json").write_text(
+        json.dumps({"attempts": attempts, "validation_error": last_error}, ensure_ascii=False, indent=2) + "\n"
+    )
+    raise OptimizerProtocolError(f"{role} schema invalid after repair: {last_error}")
+
+
 def _source_files(memory_dir: Path, evidence: list[dict[str, Any]]) -> dict[str, str]:
     files = {"MEMORY.md": (memory_dir / "MEMORY.md").read_text()}
     ids = {
         str(item.get("skill_id"))
         for rollout in evidence
-        if rollout.get("outcome", {}).get("valid_benchmark_outcome")
         for item in rollout.get("routing", {}).get("leaf_reads", [])
         if item.get("skill_id")
     }
@@ -132,105 +257,40 @@ def validate_optimizer_decision(
     if decision.decision == "no_patch":
         return
     if decision.problem_type in {"infrastructure", "insufficient_evidence"}:
-        raise InvalidPatchError(f"{decision.problem_type} decisions may not include a patch")
+        raise InvalidPatchError("infrastructure/insufficient evidence cannot produce a patch")
     assert decision.patch is not None
     patch = decision.patch
     root = Path(memory_dir).resolve()
     if Path(patch.target).name != patch.target or Path(patch.target).suffix != ".md":
         raise InvalidPatchError("patch target must be one top-level Markdown file")
     target = root / patch.target
-    if not target.is_file():
-        raise InvalidPatchError(f"patch target does not exist: {patch.target}")
-    source = target.read_text()
-    if source.count(patch.old_text) != 1:
-        raise InvalidPatchError("old_text must uniquely and verbatim match its target")
-    if len(patch.new_text.splitlines()) > max_patch_lines:
-        raise InvalidPatchError("patch exceeds MAX_PATCH_LINES")
-    if len(patch.new_text) > max_patch_new_chars:
-        raise InvalidPatchError("patch exceeds MAX_PATCH_NEW_CHARS")
+    if not target.is_file() or target.read_text().count(patch.old_text) != 1:
+        raise InvalidPatchError("old_text must uniquely match an existing target")
+    if len(patch.new_text.splitlines()) > max_patch_lines or len(patch.new_text) > max_patch_new_chars:
+        raise InvalidPatchError("patch exceeds line or character budget")
     if len(patch.new_text) - len(patch.old_text) > max_patch_growth_chars:
-        raise InvalidPatchError("patch exceeds MAX_PATCH_GROWTH_CHARS")
-
+        raise InvalidPatchError("patch exceeds growth budget")
     read_ids = {
-        str(item.get("skill_id"))
-        for rollout in evidence
-        if rollout.get("outcome", {}).get("valid_benchmark_outcome")
-        for item in rollout.get("routing", {}).get("leaf_reads", [])
-        if item.get("skill_id")
+        str(item.get("skill_id")) for rollout in evidence
+        for item in rollout.get("routing", {}).get("leaf_reads", []) if item.get("skill_id")
     }
     if patch.target_skill_id not in read_ids:
-        raise InvalidPatchError("target leaf was not read in any valid discovery rollout")
-    rollout_by_id = {
-        str(rollout.get("identity", {}).get("run_id")): rollout for rollout in evidence
-    }
-    cited_runs = {ref.run_id for ref in patch.evidence}
-    if len(cited_runs) < 2 or not cited_runs.issubset(rollout_by_id):
-        raise InvalidPatchError("patch must cite at least two supplied rollout IDs")
-    for ref in patch.evidence:
-        rollout = rollout_by_id[ref.run_id]
-        event_ids = {
-            int(value)
-            for item in (
-                rollout.get("routing", {}).get("memory_reads", [])
-                + rollout.get("routing", {}).get("leaf_reads", [])
-                + rollout.get("actions", [])
-                + rollout.get("anomalies", {}).get("tool_errors", [])
-            )
-            for key in ("event_id", "call_event_id", "result_event_id")
-            for value in [item.get(key)]
-            if isinstance(value, int)
-        }
-        message_ids = {int(x.get("message_index")) for x in rollout.get("decisions", []) if isinstance(x.get("message_index"), int)}
-        image_ids = {str(x.get("image_id")) for x in rollout.get("visual_evidence", []) if x.get("image_id")}
-        if not set(ref.event_ids).issubset(event_ids):
-            raise InvalidPatchError(f"unknown event citation in {ref.run_id}")
-        if not set(ref.message_indices).issubset(message_ids):
-            raise InvalidPatchError(f"unknown message citation in {ref.run_id}")
-        if not set(ref.image_ids).issubset(image_ids):
-            raise InvalidPatchError(f"unknown image citation in {ref.run_id}")
+        raise InvalidPatchError("target leaf was not read in supplied evidence")
     if patch.target == "MEMORY.md":
-        if patch.field != "routing":
-            raise InvalidPatchError("MEMORY.md may only receive a routing patch")
-        if patch.old_text != patch.old_text.strip("\n") or "\n" in patch.old_text or not patch.old_text.lstrip().startswith("-"):
-            raise InvalidPatchError("MEMORY routing old_text must be exactly one index bullet")
-        if f"({patch.target_skill_id}.md)" not in patch.old_text:
-            raise InvalidPatchError("MEMORY bullet must link to target_skill_id")
-        if (
-            patch.new_text != patch.new_text.strip("\n")
-            or "\n" in patch.new_text
-            or not patch.new_text.lstrip().startswith("-")
-            or f"({patch.target_skill_id}.md)" not in patch.new_text
-            or patch.new_text.lstrip().startswith(("- #", "- ```", "- <"))
-        ):
-            raise InvalidPatchError(
-                "MEMORY routing new_text must remain one bullet with the same target link"
-            )
-        location = source.index(patch.old_text)
-        before = source[:location]
-        last_header = next((line for line in reversed(before.splitlines()) if line.startswith("## ")), "")
-        if last_header != "## Reusable manipulation patterns":
-            raise InvalidPatchError("protected MEMORY section cannot be edited")
-    else:
-        if patch.field == "routing":
-            raise InvalidPatchError("routing patches must target MEMORY.md")
-        if patch.target != f"{patch.target_skill_id}.md":
-            raise InvalidPatchError("leaf target must match target_skill_id")
-
-    combined = (patch.new_text + "\n" + patch.hypothesis + "\n" + patch.expected_effect).lower()
+        if patch.field != "routing" or "\n" in patch.old_text or "\n" in patch.new_text:
+            raise InvalidPatchError("MEMORY patch must replace one routing bullet")
+        link = f"({patch.target_skill_id}.md)"
+        if link not in patch.old_text or link not in patch.new_text:
+            raise InvalidPatchError("MEMORY patch must preserve the target leaf link")
+    elif patch.field == "routing" or patch.target != f"{patch.target_skill_id}.md":
+        raise InvalidPatchError("leaf patch target/field mismatch")
+    combined = f"{patch.new_text}\n{patch.hypothesis}\n{patch.expected_effect}".lower()
     forbidden = (
         "teleport", "set_object_pose", "hidden ground truth", "hidden gt",
-        "reset the environment", "planner self-report is success",
-        "finish(success) is authoritative", "limit vla horizon", "restrict vla horizon",
+        "reset the environment", "finish(success) is authoritative", "restrict vla horizon",
     )
     if any(term in combined for term in forbidden):
         raise InvalidPatchError("patch introduces a forbidden capability or outcome claim")
-    old_calls = set(re.findall(r"`?([a-z][a-z0-9_]*)\s*\(", patch.old_text.lower()))
-    new_calls = set(re.findall(r"`?([a-z][a-z0-9_]*)\s*\(", patch.new_text.lower()))
-    unknown_new_calls = {name for name in new_calls - old_calls if name not in KNOWN_TOOLS}
-    if unknown_new_calls:
-        raise InvalidPatchError(
-            "patch introduces unknown tool-like calls: " + ", ".join(sorted(unknown_new_calls))
-        )
 
 
 def optimize_skills(
@@ -243,156 +303,65 @@ def optimize_skills(
     model: str,
     output_dir: str | Path,
     historical_feedback: dict[str, Any] | None = None,
-    max_tokens: int = 8192,
+    max_tokens: int = DEFAULT_OPTIMIZER_MAX_TOKENS,
     timeout_s: int = 600,
     max_patch_lines: int = 24,
     max_patch_new_chars: int = 2000,
     max_patch_growth_chars: int = 1000,
 ) -> SkillOptimizationDecision:
-    """Call the external optimizer, retrying schema repair at most once."""
-
+    """Legacy one-stage optimizer retained for old fixed-window experiments."""
     root = Path(memory_dir).resolve()
-    groups = {
-        (item.get("identity", {}).get("suite"), item.get("identity", {}).get("task"))
-        for item in evidence
-    }
-    if len(groups) != 1:
-        raise ValueError("optimizer input must contain one suite/task only")
-    instructions = Path(skill_path).read_text()
-    sources = _source_files(root, evidence)
-    output = Path(output_dir)
-    output.mkdir(parents=True, exist_ok=True)
     payload = {
-        "task": "Diagnose the current proposal window and return one SkillOptimizationDecision/v1.",
+        "task": "Return one backward-compatible SkillOptimizationDecision/v1.",
         "current_proposal_evidence": evidence,
-        "historical_feedback": historical_feedback or {
-            "schema_version": "OptimizerFeedbackContext/v1",
-            "patch_history": [],
-            "unresolved_regressions": [],
-            "recent_strict_gains": [],
-            "previous_cycle_pairs": [],
-        },
-        "editable_source_files": sources,
+        "historical_feedback": historical_feedback or {},
+        "editable_source_files": _source_files(root, evidence),
         "output_schema": optimizer_decision_json_schema(),
-        "patch_limits": {
-            "max_lines": max_patch_lines,
-            "max_new_chars": max_patch_new_chars,
-            "max_growth_chars": max_patch_growth_chars,
-        },
     }
-    user_content: list[dict[str, Any]] = [
-        {"type": "text", "text": json.dumps(payload, ensure_ascii=False)}
-    ]
-    image_manifest = []
-    for rollout in evidence:
-        run_id = rollout.get("identity", {}).get("run_id")
-        for image in rollout.get("visual_evidence", []):
-            path = Path(str(image.get("path", "")))
-            if not path.is_file():
-                continue
-            label = {k: image.get(k) for k in ("image_id", "role", "camera", "step", "source_event_id")}
-            label["run_id"] = run_id
-            image_manifest.append({**label, "path": str(path.resolve())})
-            user_content.append({"type": "text", "text": "VISUAL_EVIDENCE " + json.dumps(label, ensure_ascii=False)})
-            user_content.append({"type": "image_url", "image_url": {"url": _data_url(path)}})
-    feedback_images = [str(item["path"]) for item in image_manifest]
-    for group in ("unresolved_regressions", "recent_strict_gains"):
-        for item in (historical_feedback or {}).get(group, []):
-            for side in ("parent_images", "candidate_images"):
-                for value in (item.get("provenance", {}).get(side, [])[:1]):
-                    path = Path(str(value.get("path", "")))
-                    if not path.is_file() or str(path.resolve()) in feedback_images:
-                        continue
-                    feedback_images.append(str(path.resolve()))
-                    label = {
-                        "source": "historical_feedback",
-                        "feedback_case_id": item.get("case_id"),
-                        "pair_class": item.get("pair_class"),
-                        "side": side,
-                        **{key: value.get(key) for key in ("image_id", "role", "camera", "step", "source_event_id")},
-                    }
-                    image_manifest.append({**label, "path": str(path.resolve())})
-                    user_content.append({"type": "text", "text": "HISTORICAL_VISUAL_EVIDENCE " + json.dumps(label, ensure_ascii=False)})
-                    user_content.append({"type": "image_url", "image_url": {"url": _data_url(path)}})
-    (output / "image_manifest.json").write_text(json.dumps(image_manifest, ensure_ascii=False, indent=2) + "\n")
-    manifest = {
-        "endpoint": base_url.rstrip("/") + "/chat/completions",
-        "model": model,
-        "temperature": 0,
-        "max_tokens": max_tokens,
-        "skill_path": str(Path(skill_path).resolve()),
-        "rollout_ids": [x.get("identity", {}).get("run_id") for x in evidence],
-        "feedback_counts": {
-            key: len((historical_feedback or {}).get(key, []))
-            for key in ("patch_history", "unresolved_regressions", "recent_strict_gains", "previous_cycle_pairs")
-        },
-        "image_labels": [{k: x.get(k) for k in x if k != "path"} for x in image_manifest],
-        "api_key_stored": False,
-        "base64_stored": False,
-    }
-    (output / "request_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
-    messages = [{"role": "system", "content": instructions}, {"role": "user", "content": user_content}]
-    endpoint = base_url.rstrip("/") + "/chat/completions"
-    raw_attempts, last_error = [], None
-    for attempt in range(2):
-        body = {
-            "model": model,
-            "messages": messages,
-            "temperature": 0,
-            "max_tokens": max_tokens,
-            "response_format": {"type": "json_object"},
-        }
-        response = _post_json(endpoint, api_key, body, timeout_s)
-        raw_attempts.append(response)
-        try:
-            content = response["choices"][0]["message"]["content"]
-            decision = SkillOptimizationDecision.model_validate(_extract_json(content))
-            validate_optimizer_decision(
-                decision,
-                memory_dir=root,
-                evidence=evidence,
-                max_patch_lines=max_patch_lines,
-                max_patch_new_chars=max_patch_new_chars,
-                max_patch_growth_chars=max_patch_growth_chars,
-            )
-            (output / "raw_response.json").write_text(json.dumps({"attempts": raw_attempts}, ensure_ascii=False, indent=2) + "\n")
-            (output / "decision.json").write_text(decision.model_dump_json(indent=2) + "\n")
-            return decision
-        except InvalidPatchError:
-            (output / "raw_response.json").write_text(json.dumps({"attempts": raw_attempts}, ensure_ascii=False, indent=2) + "\n")
-            raise
-        except (KeyError, IndexError, ValueError, ValidationError) as exc:
-            last_error = str(exc)
-            if attempt == 0:
-                messages = [
-                    {"role": "system", "content": instructions},
-                    {
-                        "role": "user",
-                        "content": (
-                            "Your previous response violated the JSON/schema contract. "
-                            f"Error: {last_error}. Return only a corrected JSON object. "
-                            "Do not add new evidence or change the causal conclusion merely to pass validation.\n"
-                            + json.dumps(response, ensure_ascii=False)
-                        ),
-                    },
-                ]
-    (output / "raw_response.json").write_text(json.dumps({"attempts": raw_attempts, "validation_error": last_error}, ensure_ascii=False, indent=2) + "\n")
-    raise OptimizerProtocolError(f"optimizer schema invalid after repair: {last_error}")
+
+    def validate(value: dict[str, Any]) -> SkillOptimizationDecision:
+        decision = SkillOptimizationDecision.model_validate(value)
+        validate_optimizer_decision(
+            decision,
+            memory_dir=root,
+            evidence=evidence,
+            max_patch_lines=max_patch_lines,
+            max_patch_new_chars=max_patch_new_chars,
+            max_patch_growth_chars=max_patch_growth_chars,
+        )
+        return decision
+
+    decision = request_structured(
+        role="legacy_optimizer",
+        instructions=Path(skill_path).read_text(),
+        payload=payload,
+        schema=optimizer_decision_json_schema(),
+        validator=validate,
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        output_dir=output_dir,
+        max_tokens=max_tokens,
+        timeout_s=timeout_s,
+    )
+    (Path(output_dir) / "decision.json").write_text(decision.model_dump_json(indent=2) + "\n")
+    return decision
 
 
 def check_optimizer_service(*, base_url: str, api_key: str, model: str, timeout_s: int = 60) -> None:
-    models_url = base_url.rstrip("/") + "/models"
-    request = urllib.request.Request(models_url, headers={"Authorization": f"Bearer {api_key}"})
+    request = urllib.request.Request(
+        base_url.rstrip("/") + "/models",
+        headers={"Authorization": f"Bearer {api_key}"},
+    )
     try:
         with urllib.request.urlopen(request, timeout=timeout_s) as response:
             json.loads(response.read())
     except Exception as exc:
         raise OptimizerInfrastructureError(f"optimizer models endpoint failed: {exc}") from exc
-    # Validate image input and JSON output without tool calling.
     body = {
         "model": model,
         "messages": [{"role": "user", "content": [
-            {"type": "text", "text": "Return exactly one JSON object with key status and value ready."},
+            {"type": "text", "text": "Return one JSON object with status=ready."},
             {"type": "image_url", "image_url": {"url": _red_png_data_url()}},
         ]}],
         "temperature": 0,

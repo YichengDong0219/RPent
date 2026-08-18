@@ -178,8 +178,11 @@ def _run_case(
     task: int,
     seed: int,
     cycle_name: str,
+    repeat: int = 0,
 ) -> dict[str, Any]:
-    case_id = f"{suite}__t{task:03d}__s{seed:06d}"
+    case_id = f"{suite}__t{task:03d}__s{seed:06d}__r{repeat:02d}"
+    run_id = f"{cycle_name}__{phase}__{role}__{case_id}"
+    planner_sampling_seed = args.planner_seed_base + seed * 1000 + repeat
     run_root = args.experiment_dir / "rollouts" / cycle_name / phase / role / case_id
     result_path = run_root / "result.json"
     if result_path.is_file():
@@ -215,6 +218,8 @@ def _run_case(
             str(args.max_tokens),
             "--max-turns",
             str(args.max_turns),
+            "--planner-sampling-seed",
+            str(planner_sampling_seed),
             "--max-episode-steps",
             str(args.max_episode_steps),
             "--hires-retention-steps",
@@ -232,6 +237,19 @@ def _run_case(
             *args.extra_rpent_arg,
         ]
         print(f"[skill-evolve] RUN {phase}/{role}/{case_id}, attempt {attempt}", flush=True)
+        run_env = os.environ.copy()
+        run_env["RPENT_EVOLUTION_CONTEXT_JSON"] = json.dumps({
+            "run_id": run_id,
+            "suite": suite,
+            "task": task,
+            "seed": seed,
+            "repeat": repeat,
+            "planner_sampling_seed": planner_sampling_seed,
+            "reset_identity": f"{suite}:t{task}:s{seed}:r{repeat}",
+            "planner_version": args.model,
+            "vla_version": args.vla_endpoint,
+            "library_role": role,
+        }, separators=(",", ":"))
         with (attempt_dir / "console.log").open("w") as log:
             try:
                 completed = subprocess.run(
@@ -241,7 +259,7 @@ def _run_case(
                     stderr=subprocess.STDOUT,
                     timeout=args.run_timeout_s,
                     check=False,
-                    env=os.environ.copy(),
+                    env=run_env,
                 )
                 exit_code = completed.returncode
             except subprocess.TimeoutExpired:
@@ -259,6 +277,9 @@ def _run_case(
                 "suite": suite,
                 "task": task,
                 "seed": seed,
+                "repeat": repeat,
+                "run_id": run_id,
+                "planner_sampling_seed": planner_sampling_seed,
                 "attempt": attempt,
                 "vla_endpoint": args.vla_endpoint,
                 "result_path": str(result_path),
@@ -348,7 +369,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--optimizer-base-url", required=True)
     parser.add_argument("--optimizer-api-key", default="EMPTY")
     parser.add_argument("--optimizer-model", required=True)
-    parser.add_argument("--optimizer-max-tokens", type=int, default=8192)
+    parser.add_argument("--optimizer-max-tokens", type=int, default=24576)
     parser.add_argument("--optimizer-timeout-s", type=int, default=600)
     parser.add_argument("--optimizer-max-images-per-rollout", type=int, default=6)
     parser.add_argument("--optimizer-skill-path", type=Path, required=True)
@@ -360,6 +381,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--hires-retention-steps", type=int, default=5)
     parser.add_argument("--run-timeout-s", type=int, default=3600)
     parser.add_argument("--max-attempts", type=int, default=2)
+    parser.add_argument("--planner-seed-base", type=int, default=100000)
     parser.add_argument("--minimum-activations", type=int, default=2)
     parser.add_argument("--extra-rpent-arg", action="append", default=[])
     parser.add_argument("--python", default=sys.executable)

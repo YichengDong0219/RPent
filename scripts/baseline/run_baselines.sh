@@ -47,13 +47,13 @@ RESULT_HELPER="${SCRIPT_DIR}/baseline_results.py"
 
 # 实验名称会成为输出目录名。
 # 更换模型、prompt、任务集合或关键参数后，请换一个新名称，避免结果混合。
-EXPERIMENT_NAME="801_qwen35_9b_pi05_libero_pro_baseline"
+EXPERIMENT_NAME="818_baseline_object_lan_0"
 
 # 任务配置模式，可选：
 #   "cartesian"：最常用，运行 EVAL_SUITES × EVAL_TASK_IDS 的所有组合。
 #   "list"：     精确指定若干 suite/task，适合不同 suite 跑不同 task。
 #   "full"：     完整 LIBERO-PRO：16 个 suite × 10 个 task = 160 项。
-EVAL_MODE="${EVAL_MODE:-full}"
+EVAL_MODE="${EVAL_MODE:-cartesian}"
 
 # cartesian 模式配置。
 # 当前示例只运行冒烟任务 libero_object_swap task 2。
@@ -64,9 +64,9 @@ EVAL_MODE="${EVAL_MODE:-full}"
 #   EVAL_TASK_IDS=(0 1 2 3)
 # 运行 task 0～9 可写成：EVAL_TASK_IDS=({0..9})
 EVAL_SUITES=(
-  "libero_object_swap"
+  "libero_object_lan"
 )
-EVAL_TASK_IDS=(2)
+EVAL_TASK_IDS=(0)
 
 # list 模式配置，每行严格写成 "<suite> <task_id>"。
 # 仅当 EVAL_MODE="list" 时使用这里的内容。
@@ -79,7 +79,7 @@ EXACT_TASKS=(
 # 每个任务使用哪些随机种子，以及每个 seed 重复多少次。
 # 例如 SEEDS=(0 1 2)、REPEATS=3：每个 suite/task 共运行 9 次。
 SEEDS=(0)
-REPEATS=3
+REPEATS=10
 
 # -----------------------------------------------------------------------------
 # 2. Planner 与 Qwen-VL 服务
@@ -88,7 +88,7 @@ REPEATS=3
 # 当前配置与已经启动的 Qwen3.5-9B OpenAI 兼容服务对齐。
 PLANNER="api"
 MODEL="qwen-vl:Qwen3.5-9B"
-QWEN_VL_BASE_URL="${QWEN_VL_BASE_URL:-http://127.0.0.1:8000/v1}"
+QWEN_VL_BASE_URL="${QWEN_VL_BASE_URL:-http://114.212.227.193:8000/v1}"
 QWEN_VL_API_KEY="${QWEN_VL_API_KEY:-EMPTY}"
 
 # 正式运行前检查 Qwen 的图片输入与工具调用，建议保持为 1。
@@ -112,9 +112,9 @@ VLA_PORT=18081
 VLA_READY_TIMEOUT_S=600
 
 # 当前 Qwen3.5-9B 服务的 max_model_len=131072（128K）。
-# MAX_TOKENS=4096 是单次回复上限，可为 RPent 的长输入和多轮工具调用留足空间。
+# MAX_TOKENS=24576 是单次回复上限，可为 RPent 的长输入和多轮工具调用留足空间。
 # RUN_TIMEOUT_S 是一个逻辑任务允许的最长实际运行时间，单位为秒。
-MAX_TOKENS=4096
+MAX_TOKENS=24576
 MAX_TURNS=40
 MAX_EPISODE_STEPS=10000
 RUN_TIMEOUT_S=3600

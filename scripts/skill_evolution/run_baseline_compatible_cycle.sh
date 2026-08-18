@@ -8,7 +8,7 @@ set -Eeuo pipefail
 # =============================================================================
 # Quick configuration
 # =============================================================================
-EXPERIMENT_NAME="libero_object_t0_sliding_window_evolution_v1"
+EXPERIMENT_NAME="libero_object_t0_failure_fix_evolution_v1"
 # Base LIBERO checkout. Standard suites use its assets directly. PRO suites
 # use the installed liberopro assets selected by LIBERO_TYPE while retaining
 # this checkout for the shared LIBERO import surface.
@@ -20,19 +20,23 @@ LIBERO_TYPE="pro"
 EVAL_TASKS=(
   "libero_object_lan:0"
 )
-# Sliding task-local evolution stream. Proposal and forward windows advance by
-# SEED_STRIDE; retention is selected automatically from historical successes
-# and unresolved regressions in this task's archive.
+# Causal task-local evolution stream. A proposal batch learns a Failure/Fix
+# contrast; forward and retention run only after the target causal gate passes.
 SEED_START=0
 SEED_STOP_EXCLUSIVE=50
-PROPOSAL_WINDOW_SIZE=3
-FORWARD_WINDOW_SIZE=3
-SEED_STRIDE=3
-RETENTION_WINDOW_SIZE=4
+PROPOSAL_SEED_COUNT=5
+REPEATS_PER_SEED=2
+PROPOSAL_TOPUP_SEED_COUNT=2
+MAX_PROPOSAL_ROLLOUTS=18
+MIN_FAILURE_SUPPORT=2
+MIN_SUCCESS_REFERENCES=1
+FORWARD_SEED_COUNT=2
+FORWARD_REPEATS=2
+RETENTION_CASES=4
+MAX_CANDIDATE_ROUNDS_PER_CLUSTER=2
+DIAGNOSER_MAX_IMAGES=6
 MAX_CYCLES_PER_RUN=1
 MAX_CONSECUTIVE_NO_GAIN=3
-PLANNER_TURN_IMPROVEMENT=1
-MINIMUM_ACTIVATIONS=2
 RESET_STALLED=0
 
 # Execution planner (same values as the baseline experiment).
@@ -40,17 +44,19 @@ PLANNER="api"
 PLANNER_MODEL="qwen-vl:Qwen3.5-9B"
 QWEN_BASE_URL="http://114.212.227.193:8000/v1"
 QWEN_API_KEY="EMPTY"
-MAX_TOKENS=4096
+MAX_TOKENS=24576
 MAX_TURNS=40
+PLANNER_SEED_BASE=100000
 
 # Independent stronger multimodal skill optimizer (OpenAI-compatible API).
 SKILL_OPTIMIZER_BASE_URL="http://114.212.227.193:8000/v1"
 SKILL_OPTIMIZER_API_KEY="EMPTY"
 SKILL_OPTIMIZER_MODEL="Qwen3.5-9B"
-SKILL_OPTIMIZER_MAX_TOKENS=8192
+SKILL_OPTIMIZER_MAX_TOKENS=24576
 SKILL_OPTIMIZER_TIMEOUT_S=600
-SKILL_OPTIMIZER_MAX_IMAGES_PER_ROLLOUT=6
-SKILL_OPTIMIZER_SKILL_PATH="scripts/skill_evolution/skill_optimizer/SKILL.md"
+EVIDENCE_MAX_IMAGES_PER_ROLLOUT=6
+SKILL_DIAGNOSER_PATH="scripts/skill_evolution/skill_diagnoser/SKILL.md"
+SKILL_PATCH_WRITER_PATH="scripts/skill_evolution/skill_patch_writer/SKILL.md"
 MAX_PATCH_LINES=24
 MAX_PATCH_NEW_CHARS=2000
 MAX_PATCH_GROWTH_CHARS=1000
@@ -215,14 +221,19 @@ for task_index in "${!EVAL_SUITES[@]}"; do
     --suite "${eval_suite}" --task "${eval_task_id}" \
     --seed-start "${SEED_START}" \
     --seed-stop-exclusive "${SEED_STOP_EXCLUSIVE}" \
-    --proposal-window-size "${PROPOSAL_WINDOW_SIZE}" \
-    --forward-window-size "${FORWARD_WINDOW_SIZE}" \
-    --seed-stride "${SEED_STRIDE}" \
-    --retention-window-size "${RETENTION_WINDOW_SIZE}" \
+    --proposal-seed-count "${PROPOSAL_SEED_COUNT}" \
+    --repeats-per-seed "${REPEATS_PER_SEED}" \
+    --proposal-topup-seed-count "${PROPOSAL_TOPUP_SEED_COUNT}" \
+    --max-proposal-rollouts "${MAX_PROPOSAL_ROLLOUTS}" \
+    --min-failure-support "${MIN_FAILURE_SUPPORT}" \
+    --min-success-references "${MIN_SUCCESS_REFERENCES}" \
+    --forward-seed-count "${FORWARD_SEED_COUNT}" \
+    --forward-repeats "${FORWARD_REPEATS}" \
+    --retention-cases "${RETENTION_CASES}" \
+    --max-candidate-rounds-per-cluster "${MAX_CANDIDATE_ROUNDS_PER_CLUSTER}" \
+    --diagnoser-max-images "${DIAGNOSER_MAX_IMAGES}" \
     --max-cycles-per-run "${MAX_CYCLES_PER_RUN}" \
     --max-consecutive-no-gain "${MAX_CONSECUTIVE_NO_GAIN}" \
-    --planner-turn-improvement "${PLANNER_TURN_IMPROVEMENT}" \
-    --minimum-activations "${MINIMUM_ACTIVATIONS}" \
     --planner "${PLANNER}" --model "${PLANNER_MODEL}" \
     --qwen-base-url "${QWEN_BASE_URL}" --qwen-api-key "${QWEN_API_KEY}" \
     --optimizer-base-url "${SKILL_OPTIMIZER_BASE_URL}" \
@@ -230,13 +241,15 @@ for task_index in "${!EVAL_SUITES[@]}"; do
     --optimizer-model "${SKILL_OPTIMIZER_MODEL}" \
     --optimizer-max-tokens "${SKILL_OPTIMIZER_MAX_TOKENS}" \
     --optimizer-timeout-s "${SKILL_OPTIMIZER_TIMEOUT_S}" \
-    --optimizer-max-images-per-rollout "${SKILL_OPTIMIZER_MAX_IMAGES_PER_ROLLOUT}" \
-    --optimizer-skill-path "${REPO_ROOT}/${SKILL_OPTIMIZER_SKILL_PATH}" \
+    --evidence-max-images-per-rollout "${EVIDENCE_MAX_IMAGES_PER_ROLLOUT}" \
+    --diagnoser-skill-path "${REPO_ROOT}/${SKILL_DIAGNOSER_PATH}" \
+    --patch-writer-skill-path "${REPO_ROOT}/${SKILL_PATCH_WRITER_PATH}" \
     --max-patch-lines "${MAX_PATCH_LINES}" \
     --max-patch-new-chars "${MAX_PATCH_NEW_CHARS}" \
     --max-patch-growth-chars "${MAX_PATCH_GROWTH_CHARS}" \
     --vla-endpoint "${VLA_ENDPOINT}" --libero-type "${LIBERO_TYPE}" \
     --cuda-device "${VLA_GPU}" --max-tokens "${MAX_TOKENS}" \
+    --planner-seed-base "${PLANNER_SEED_BASE}" \
     --max-turns "${MAX_TURNS}" \
     --max-episode-steps "${MAX_EPISODE_STEPS}" \
     --hires-retention-steps "${HIRES_RETENTION_STEPS}" \

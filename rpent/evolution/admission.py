@@ -106,15 +106,15 @@ def decide_admission(
 
 @dataclass(frozen=True)
 class WindowedAdmissionDecision:
-    """Dominance decision across proposal, forward, and retention windows."""
+    """Causal-rescue decision across proposal, forward, and retention."""
 
     decision: Decision
     outcome: str
     reasons: list[str]
     window_summaries: dict[str, dict[str, int]]
     regressions: list[str]
-    strict_improvements: list[dict[str, Any]]
-    candidate_activations: int
+    causal_rescues: list[dict[str, Any]]
+    candidate_usages: int
 
     def to_dict(self) -> dict[str, Any]:
         return {"schema_version": "WindowedAdmissionDecision/v1", **asdict(self)}
@@ -125,7 +125,7 @@ def decide_windowed_admission(
     *,
     minimum_activations: int = 2,
 ) -> WindowedAdmissionDecision:
-    """Require per-case success dominance and at least one attributed gain."""
+    """Require zero regressions and at least one attributed Failure/Fix rescue."""
 
     pairs = [
         item if isinstance(item, PairedCaseFeedback) else PairedCaseFeedback.model_validate(item)
@@ -155,42 +155,37 @@ def decide_windowed_admission(
         for value in (item.parent.safety_violations, item.candidate.safety_violations)
     )
     regressions = [item.case_id for item in pairs if item.pair_class == "regression"]
-    improvements = [
+    rescues = [
         {
             "phase": item.phase,
             "case_id": item.case_id,
-            "kind": item.pair_class,
+            "kind": item.fix_kind,
             "parent_turns": item.parent.planner_turns,
             "candidate_turns": item.candidate.planner_turns,
         }
         for item in pairs
-        if item.strict_improvement
+        if item.attributed_rescue
     ]
-    activations = sum(item.candidate.target_skill_active for item in pairs)
+    usages = sum(item.candidate.target_skill_used for item in pairs)
     reasons: list[str] = []
     if regressions:
         reasons.append("success_regression")
-    if not improvements:
-        reasons.append("no_strict_gain")
-    if activations < minimum_activations:
-        reasons.append("insufficient_candidate_activation")
+    if not rescues:
+        reasons.append("no_attributed_causal_rescue")
     if safety:
         reasons.append("safety_violation")
     if reasons:
         outcome = (
-            "rejected_success_regression"
-            if regressions else "rejected_no_strict_gain"
-            if "no_strict_gain" in reasons else "rejected_protocol"
+            "rejected_regression" if regressions
+            else "rejected_fix_ineffective" if any(item.pair_class == "fix_ineffective" for item in pairs)
+            else "rejected_incidental_success" if any(item.pair_class == "incidental_success" for item in pairs)
+            else "rejected_no_intervention"
         )
         return WindowedAdmissionDecision(
-            "rejected", outcome, reasons, summaries, regressions, improvements, activations
+            "rejected", outcome, reasons, summaries, regressions, rescues, usages
         )
-    outcome = (
-        "accepted_success_gain"
-        if any(item["kind"] == "success_gain" for item in improvements)
-        else "accepted_turn_efficiency"
-    )
+    outcome = "accepted_causal_recovery" if any(item["kind"] == "recovery" for item in rescues) else "accepted_causal_prevention"
     return WindowedAdmissionDecision(
-        "accepted", outcome, ["all_dominance_gates_passed"], summaries,
-        regressions, improvements, activations,
+        "accepted", outcome, ["causal_rescue_and_dominance_gates_passed"], summaries,
+        regressions, rescues, usages,
     )

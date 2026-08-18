@@ -1,291 +1,273 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
+import pytest
+
 from rpent.evolution.admission import decide_windowed_admission
+from rpent.evolution.failure_fix import build_batch_artifacts
+from rpent.evolution.failure_optimizer import compile_overlay_patch, shadow_check
+from rpent.evolution.library import apply_overlay, create_snapshot
 from rpent.evolution.schemas import (
-    EvolutionWindowState,
-    PairedCaseFeedback,
-    PairedCaseSide,
+    EvidenceRef,
+    FailureFixRecord,
+    SkillFailureDiagnosis,
+    SkillUpdateIntent,
 )
-from rpent.evolution.stream import (
-    advance_after_evaluation,
-    build_paired_feedback,
-    empty_retention_archive,
-    feedback_context,
-    seed_window,
-    select_retention_cases,
-    update_retention_archive,
-)
+from rpent.evolution.stream import build_paired_feedback
 
 
-def _pair(
-    case: str,
-    *,
-    phase: str = "proposal",
-    parent_success: bool,
-    candidate_success: bool,
-    parent_turns: int | None = 10,
-    candidate_turns: int | None = 10,
-    active: bool = True,
-    parent_status: str = "success",
-    candidate_status: str = "success",
-) -> PairedCaseFeedback:
-    if parent_success and not candidate_success:
-        pair_class = "regression"
-    elif not parent_success and candidate_success:
-        pair_class = "success_gain"
-    elif parent_success and candidate_success and candidate_turns is not None and parent_turns is not None and candidate_turns < parent_turns:
-        pair_class = "efficiency_gain"
-    elif parent_success and candidate_success:
-        pair_class = "stable_success"
-    else:
-        pair_class = "unresolved_failure"
-    return PairedCaseFeedback(
-        cycle="cycle_001",
-        phase=phase,
-        case_id=case,
-        suite="suite",
-        task=0,
-        seed=int(case[1:]),
-        patch_id="patch",
-        patch={"patch_id": "patch"},
-        target_skill_id="skill",
-        parent=PairedCaseSide(
-            library="S000", status=parent_status,
-            benchmark_success=parent_success, planner_turns=parent_turns,
-        ),
-        candidate=PairedCaseSide(
-            library="candidate", status=candidate_status,
-            benchmark_success=candidate_success, planner_turns=candidate_turns,
-            target_skill_active=active,
-        ),
-        pair_class=pair_class,
-        strict_improvement=active and pair_class in {"success_gain", "efficiency_gain"},
-    )
-
-
-def test_windowed_admission_rejects_any_parent_success_regression() -> None:
-    result = decide_windowed_admission(
-        [
-            _pair("c0", parent_success=False, candidate_success=True),
-            _pair("c1", parent_success=False, candidate_success=True),
-            _pair("c2", phase="forward", parent_success=True, candidate_success=False),
-        ],
-        minimum_activations=2,
-    )
-    assert result.decision == "rejected"
-    assert result.outcome == "rejected_success_regression"
-
-
-def test_paired_feedback_uses_authoritative_success_turns_and_target_activation() -> None:
-    parent = {
-        "case_id": "suite__t000__s000000", "suite": "suite", "task": 0, "seed": 0,
-        "library": "S000", "status": "success", "benchmark_success": True,
-        "planner_turns": 10, "activated_skill_ids": ["skill"], "compact_events": [],
-    }
-    candidate = {
-        **parent, "library": "candidate", "planner_turns": 9,
-        "activated_skill_ids": ["skill"],
-    }
-    pair = build_paired_feedback(
-        cycle="cycle_001", phase="proposal", parent_results=[parent],
-        candidate_results=[candidate], patch={"patch_id": "patch"},
-        target_skill_id="skill", turn_improvement=1,
-    )[0]
-    assert pair.pair_class == "efficiency_gain"
-    assert pair.strict_improvement is True
-
-
-def test_windowed_admission_requires_strict_gain() -> None:
-    result = decide_windowed_admission(
-        [
-            _pair("c0", parent_success=True, candidate_success=True),
-            _pair("c1", phase="forward", parent_success=True, candidate_success=True),
-        ],
-        minimum_activations=2,
-    )
-    assert result.outcome == "rejected_no_strict_gain"
-
-
-def test_windowed_admission_accepts_success_or_turn_gain() -> None:
-    success = decide_windowed_admission(
-        [
-            _pair("c0", parent_success=False, candidate_success=True),
-            _pair("c1", phase="forward", parent_success=True, candidate_success=True),
-        ],
-        minimum_activations=2,
-    )
-    assert success.outcome == "accepted_success_gain"
-
-    efficient = decide_windowed_admission(
-        [
-            _pair("c0", parent_success=True, candidate_success=True, candidate_turns=9),
-            _pair("c1", phase="retention", parent_success=True, candidate_success=True),
-        ],
-        minimum_activations=2,
-    )
-    assert efficient.outcome == "accepted_turn_efficiency"
-
-
-def test_turn_drop_does_not_count_when_task_failed_and_infra_is_pending() -> None:
-    failed = decide_windowed_admission(
-        [
-            _pair("c0", parent_success=False, candidate_success=False, parent_turns=10, candidate_turns=1),
-            _pair("c1", phase="forward", parent_success=False, candidate_success=False),
-        ],
-        minimum_activations=2,
-    )
-    assert failed.outcome == "rejected_no_strict_gain"
-    pending = decide_windowed_admission(
-        [
-            _pair("c0", parent_success=False, candidate_success=True, parent_status="agent_error"),
-            _pair("c1", phase="forward", parent_success=False, candidate_success=True),
-        ],
-        minimum_activations=2,
-    )
-    assert pending.outcome == "pending_infrastructure"
-
-
-def test_retention_prioritizes_regression_then_round_robins() -> None:
-    archive = {
-        "schema_version": "RetentionArchive/v1",
-        "cases": [
-            {"case_id": "suite__t000__s000000", "suite": "suite", "task": 0, "seed": 0, "unresolved_regression": False},
-            {"case_id": "suite__t000__s000001", "suite": "suite", "task": 0, "seed": 1, "unresolved_regression": True, "first_seen_cycle": "cycle_001"},
-            {"case_id": "suite__t000__s000002", "suite": "suite", "task": 0, "seed": 2, "unresolved_regression": False},
-        ],
-    }
-    selected, cursor = select_retention_cases(archive, exclude=set(), size=2, cursor=0)
-    assert selected[0] == ("suite", 0, 1)
-    assert selected[1] == ("suite", 0, 0)
-    selected_next, _ = select_retention_cases(archive, exclude=set(), size=2, cursor=cursor)
-    assert selected_next[0] == ("suite", 0, 1)
-    assert selected_next[1] == ("suite", 0, 2)
-
-
-def test_archive_resolution_requires_accepted_candidate() -> None:
-    formal = [{
-        "case_id": "c0", "suite": "suite", "task": 0, "seed": 0,
-        "benchmark_success": True, "library": "S000",
-    }]
-    regression = _pair("c0", parent_success=True, candidate_success=False)
-    archive = update_retention_archive(
-        empty_retention_archive(), cycle="cycle_001", formal_results=formal,
-        feedback=[regression], accepted=False,
-    )
-    assert archive["cases"][0]["unresolved_regression"] is True
-    restored = _pair("c0", parent_success=True, candidate_success=True)
-    still_open = update_retention_archive(
-        archive, cycle="cycle_002", formal_results=formal,
-        feedback=[restored], accepted=False,
-    )
-    assert still_open["cases"][0]["unresolved_regression"] is True
-    resolved = update_retention_archive(
-        archive, cycle="cycle_002", formal_results=formal,
-        feedback=[restored], accepted=True,
-    )
-    assert resolved["cases"][0]["unresolved_regression"] is False
-
-
-def test_feedback_context_is_bounded_and_state_promotes_correct_side() -> None:
-    pairs = [
-        _pair(f"c{index}", parent_success=True, candidate_success=False).model_dump(mode="json")
-        for index in range(6)
-    ]
-    context = feedback_context(
-        pair_history=pairs,
-        patch_history=[{"cycle": f"cycle_{index:03d}"} for index in range(5)],
-        archive={
-            "schema_version": "RetentionArchive/v1",
-            "cases": [
-                {"case_id": f"c{index}", "unresolved_regression": True}
-                for index in range(6)
-            ],
+def _rollout(run_id: str, *, success: bool, use_skill: bool, tool: str) -> dict:
+    leaf_reads = [{"skill_id": "skill", "event_id": 1}] if use_skill else []
+    decisions = [{
+        "message_index": 1,
+        "visible_text": "Using skill.md",
+        "explicit_skill_references": ["skill"],
+        "tool_calls": [{"trace_event_id": 2, "tool": tool, "matched": True}],
+    }] if use_skill else []
+    diagnostics = {"libero_terminated": True} if success else {}
+    return {
+        "schema_version": "RolloutEvidence/v2",
+        "identity": {
+            "run_id": run_id, "suite": "suite", "task": 0, "seed": 0,
+            "repeat": 0, "planner_sampling_seed": 100,
+            "reset_identity": "suite:t0:s0:r0", "causal_pairing_eligible": True,
         },
-    )
-    assert len(context["patch_history"]) == 3
-    assert len(context["unresolved_regressions"]) == 4
-
-    state = EvolutionWindowState(suite="suite", task=0, seed_cursor=0, active_cycle="cycle_001")
-    accepted = advance_after_evaluation(
-        state,
-        accepted=True,
-        next_parent_library_id="S001",
-        formal_forward_results=[{"result_path": "/candidate/result.json"}],
-        seed_stride=3,
-        max_consecutive_no_gain=3,
-    )
-    assert accepted.parent_library_id == "S001"
-    assert accepted.proposal_sources == ["/candidate/result.json"]
-    rejected = advance_after_evaluation(
-        state,
-        accepted=False,
-        next_parent_library_id="S000",
-        formal_forward_results=[{"result_path": "/parent/result.json"}],
-        seed_stride=3,
-        max_consecutive_no_gain=3,
-    )
-    assert rejected.parent_library_id == "S000"
-    assert rejected.proposal_sources == ["/parent/result.json"]
-    assert seed_window(48, 3, 50) == [48, 49]
-    assert seed_window(49, 3, 50) == []
-
-
-def test_synthetic_rejection_feedback_then_accepted_repair() -> None:
-    state = EvolutionWindowState(suite="suite", task=0, seed_cursor=0)
-    archive = empty_retention_archive()
-    first_pairs = [
-        _pair("c0", parent_success=True, candidate_success=False),
-        _pair("c1", phase="forward", parent_success=False, candidate_success=True),
-    ]
-    first = decide_windowed_admission(first_pairs, minimum_activations=2)
-    assert first.outcome == "rejected_success_regression"
-    archive = update_retention_archive(
-        archive,
-        cycle="cycle_001",
-        formal_results=[{
-            "case_id": "c0", "suite": "suite", "task": 0, "seed": 0,
-            "benchmark_success": True, "library": "S000",
+        "outcome": {
+            "valid_benchmark_outcome": True,
+            "benchmark_success": success,
+            "terminated": success,
+            "process_exit_code": 0,
+            "agent_error": None,
+            "planner_finish": None,
+        },
+        "routing": {
+            "leaf_reads": leaf_reads,
+            "first_physical_event_id": 2,
+            "leaf_read_before_first_physical": use_skill,
+        },
+        "decisions": decisions,
+        "actions": [{
+            "tool": tool,
+            "arguments": {"prompt": "put can in basket"},
+            "call_event_id": 2,
+            "result_event_id": 3,
+            "active_skill_ids": ["skill"] if use_skill else [],
+            "diagnostics": diagnostics,
         }],
-        feedback=first_pairs,
-        accepted=False,
-    )
-    context = feedback_context(
-        pair_history=[item.model_dump(mode="json") for item in first_pairs],
-        patch_history=[{"cycle": "cycle_001", "decision": "rejected"}],
-        archive=archive,
-    )
-    assert context["unresolved_regressions"][0]["case_id"] == "c0"
-    state = advance_after_evaluation(
-        state,
-        accepted=False,
-        next_parent_library_id="S000",
-        formal_forward_results=[{"result_path": "/parent-forward.json"}],
-        seed_stride=3,
-        max_consecutive_no_gain=3,
-    )
+        "anomalies": {"unavailable_tools": [], "path_errors": []},
+        "visual_evidence": [],
+        "cost": {"turns": 10},
+    }
 
-    second_pairs = [
-        _pair("c0", phase="retention", parent_success=True, candidate_success=True),
-        _pair("c3", parent_success=False, candidate_success=True),
+
+def _batch() -> tuple[list[dict], dict]:
+    evidence = [
+        _rollout("failure-0", success=False, use_skill=False, tool="pi0_pick"),
+        _rollout("failure-1", success=False, use_skill=False, tool="pi0_pick"),
+        _rollout("success-0", success=True, use_skill=True, tool="pi0_doubled"),
     ]
-    second = decide_windowed_admission(second_pairs, minimum_activations=2)
-    assert second.outcome == "accepted_success_gain"
-    archive = update_retention_archive(
-        archive,
-        cycle="cycle_002",
-        formal_results=[],
-        feedback=second_pairs,
-        accepted=True,
+    return evidence, build_batch_artifacts(evidence)
+
+
+def _diagnosis(batch: dict) -> SkillFailureDiagnosis:
+    contrast = batch["failure_fix_contrasts"]["contrasts"][0]
+    return SkillFailureDiagnosis.model_validate({
+        "decision": "diagnosable",
+        "diagnosis_id": "d1",
+        "cluster_id": contrast["cluster_id"],
+        "target_skill_id": "skill",
+        "patch_surface": "routing",
+        "failure_layer": "routing",
+        "observed_outcome": "task not terminated",
+        "immediate_trigger": "manual strategy chosen before leaf routing",
+        "earliest_divergence": contrast["earliest_divergence"],
+        "root_cause_hypothesis": "The MEMORY alias did not expose the applicable leaf.",
+        "competing_hypotheses": ["routing ambiguity", "physical grasp stochasticity"],
+        "fix_kind": "prevention",
+        "failure_run_ids": ["failure-0", "failure-1"],
+        "success_reference_ids": ["success-0"],
+        "evidence": [{"run_id": "failure-0"}, {"run_id": "failure-1"}, {"run_id": "success-0"}],
+        "existing_coverage": "partial",
+        "allowed_leaf_field": "routing",
+        "required_live_validation": "same-case causal replay",
+        "confidence": "medium",
+    })
+
+
+def _intent() -> SkillUpdateIntent:
+    return SkillUpdateIntent.model_validate({
+        "decision": "patch",
+        "diagnosis_id": "d1",
+        "patch_surface": "routing",
+        "target_skill_id": "skill",
+        "field": "routing",
+        "rationale": "Expose the observed single-can basket task alias.",
+        "evidence": [{"run_id": "failure-0"}, {"run_id": "failure-1"}, {"run_id": "success-0"}],
+        "routing_update": {
+            "old_bullet": "- [Skill](skill.md) - old routing",
+            "new_bullet": "- [Skill](skill.md) - place one can or package into a basket",
+        },
+    })
+
+
+def _memory(root: Path) -> Path:
+    root.mkdir()
+    (root / "MEMORY.md").write_text(
+        "# Index\n\n## Reusable manipulation patterns\n\n"
+        "- [Skill](skill.md) - old routing\n"
     )
-    assert archive["cases"][0]["unresolved_regression"] is False
-    state = advance_after_evaluation(
-        state,
-        accepted=True,
-        next_parent_library_id="S001",
-        formal_forward_results=[{"result_path": "/candidate-forward.json"}],
-        seed_stride=3,
-        max_consecutive_no_gain=3,
+    (root / "skill.md").write_text("# Skill\n\n## Procedure\nUse pi0_doubled.\n")
+    return root
+
+
+def test_health_reference_clusters_and_failure_fix_contrast() -> None:
+    _, batch = _batch()
+    assert batch["healthy_reference"]["authoritative_success_runs"] == ["success-0"]
+    cluster = batch["failure_clusters"]["clusters"][0]
+    assert cluster["failure_layer"] == "routing"
+    assert cluster["support"] == 2 and cluster["eligible"] is True
+    contrast = batch["failure_fix_contrasts"]["contrasts"][0]
+    assert contrast["success_reference_ids"] == ["success-0"]
+    assert contrast["observed_fix_signature"]["tool"] == "pi0_doubled"
+    assert contrast["candidate_skill_ids"] == ["skill"]
+
+
+def test_routing_leaf_mutual_exclusion() -> None:
+    with pytest.raises(ValueError, match="routing intent"):
+        SkillUpdateIntent.model_validate({
+            **_intent().model_dump(mode="json"),
+            "leaf_record": {
+                "condition": "x", "observable_failure": "x", "cause_hypothesis": "x",
+                "fix_kind": "prevention", "prescribed_action_signature": {},
+                "do_not_repeat": "x", "stop_or_reentry_condition": "x",
+                "evidence": [{"run_id": "a"}, {"run_id": "b"}], "expected_effect": "x",
+            },
+        })
+
+
+def test_overlay_compile_shadow_and_immutable_library(tmp_path: Path) -> None:
+    evidence, batch = _batch()
+    memory = _memory(tmp_path / "memory")
+    diagnosis = _diagnosis(batch)
+    overlay = compile_overlay_patch(
+        diagnosis=diagnosis,
+        intent=_intent(),
+        batch_artifacts=batch,
+        memory_dir=memory,
     )
-    assert state.parent_library_id == "S001"
-    assert state.seed_cursor == 6
-    assert state.consecutive_no_gain == 0
+    shadow = shadow_check(overlay, evidence=evidence)
+    assert shadow.decision == "eligible"
+    parent = create_snapshot(memory, tmp_path / "S000")
+    candidate = apply_overlay(parent, overlay, tmp_path / "candidate", library_id="candidate")
+    assert "place one can" in (candidate / "rendered_memory/MEMORY.md").read_text()
+    assert "old routing" in (parent / "rendered_memory/MEMORY.md").read_text()
+
+
+def test_leaf_overlay_appends_one_managed_record_without_overwriting_parent(tmp_path: Path) -> None:
+    evidence, batch = _batch()
+    memory = _memory(tmp_path / "memory")
+    diagnosis = _diagnosis(batch).model_copy(update={
+        "patch_surface": "leaf",
+        "failure_layer": "execution",
+        "allowed_leaf_field": "recovery",
+    })
+    intent = SkillUpdateIntent.model_validate({
+        "decision": "patch",
+        "diagnosis_id": "d1",
+        "patch_surface": "leaf",
+        "target_skill_id": "skill",
+        "field": "recovery",
+        "rationale": "Reuse the successful observed action after this failure trigger.",
+        "evidence": [
+            {"run_id": "failure-0"}, {"run_id": "failure-1"},
+            {"run_id": "success-0"},
+        ],
+        "leaf_record": {
+            "condition": "The first grasp strategy has not terminated the task.",
+            "observable_failure": "The object remains outside the basket.",
+            "cause_hypothesis": "The local pick-only strategy did not finish transport.",
+            "fix_kind": "recovery",
+            "prescribed_action_signature": {
+                "tool": "pi0_doubled", "arguments": {"prompt": "put can in basket"},
+            },
+            "do_not_repeat": "Do not repeat the failed pick-only action.",
+            "stop_or_reentry_condition": "Stop when the environment terminates.",
+            "evidence": [
+                {"run_id": "failure-0"}, {"run_id": "failure-1"},
+                {"run_id": "success-0"},
+            ],
+            "expected_effect": "Complete acquisition, transport, and placement.",
+        },
+    })
+    overlay = compile_overlay_patch(
+        diagnosis=diagnosis,
+        intent=intent,
+        batch_artifacts=batch,
+        memory_dir=memory,
+    )
+    parent = create_snapshot(memory, tmp_path / "S000")
+    candidate = apply_overlay(parent, overlay, tmp_path / "candidate", library_id="candidate")
+    assert "## Evolved guidance (managed)" in (candidate / "rendered_memory/skill.md").read_text()
+    assert "## Evolved guidance (managed)" not in (parent / "rendered_memory/skill.md").read_text()
+
+
+def _result(tmp_path: Path, name: str, evidence: dict, success: bool, role: str) -> dict:
+    path = tmp_path / f"{name}-{role}.json"
+    path.write_text(json.dumps(evidence))
+    return {
+        "case_id": name,
+        "suite": "suite", "task": 0, "seed": 0, "repeat": 0,
+        "library": role, "status": "success" if success else "benchmark_failure",
+        "benchmark_success": success, "planner_turns": 10,
+        "optimizer_evidence": str(path), "safety_violations": [],
+    }
+
+
+def test_causal_prevention_admission_and_incidental_success_rejection(tmp_path: Path) -> None:
+    evidence, batch = _batch()
+    overlay = compile_overlay_patch(
+        diagnosis=_diagnosis(batch), intent=_intent(), batch_artifacts=batch,
+        memory_dir=_memory(tmp_path / "memory"),
+    )
+    parent_evidence = evidence[0]
+    candidate_evidence = evidence[2]
+    parent = _result(tmp_path, "case", parent_evidence, False, "parent")
+    candidate = _result(tmp_path, "case", candidate_evidence, True, "candidate")
+    pair = build_paired_feedback(
+        cycle="cycle_001", phase="proposal",
+        parent_results=[parent], candidate_results=[candidate],
+        patch=overlay.model_dump(mode="json"), target_skill_id="skill",
+    )[0]
+    assert pair.pair_class == "causal_prevention"
+    assert pair.attributed_rescue is True
+    decision = decide_windowed_admission([pair])
+    assert decision.outcome == "accepted_causal_prevention"
+
+    incidental_evidence = _rollout("candidate-incidental", success=True, use_skill=False, tool="pi0_doubled")
+    incidental = _result(tmp_path, "case", incidental_evidence, True, "incidental")
+    incidental_pair = build_paired_feedback(
+        cycle="cycle_001", phase="proposal",
+        parent_results=[parent], candidate_results=[incidental],
+        patch=overlay.model_dump(mode="json"), target_skill_id="skill",
+    )[0]
+    assert incidental_pair.pair_class == "incidental_success"
+    assert decide_windowed_admission([incidental_pair]).outcome == "rejected_incidental_success"
+
+
+def test_regression_and_infrastructure_are_not_admitted() -> None:
+    from rpent.evolution.schemas import CausalCaseSide, CausalPairedFeedback
+
+    regression = CausalPairedFeedback(
+        cycle="cycle_1", phase="retention", case_id="c", suite="suite", task=0,
+        seed=0, patch_id="p", target_skill_id="skill", fix_kind="prevention",
+        parent=CausalCaseSide(library="S000", status="success", benchmark_success=True),
+        candidate=CausalCaseSide(library="candidate", status="benchmark_failure", benchmark_success=False),
+        pair_class="regression",
+    )
+    assert decide_windowed_admission([regression]).outcome == "rejected_regression"
+    pending = regression.model_copy(update={
+        "parent": regression.parent.model_copy(update={"status": "agent_error"})
+    })
+    assert decide_windowed_admission([pending]).outcome == "pending_infrastructure"

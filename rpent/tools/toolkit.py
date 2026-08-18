@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import traceback
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -116,9 +117,14 @@ class Toolkit:
             manifest = load_manifest(self._skill_library)
             self._rendered_memory = rendered_memory_dir(self._skill_library)
             trace_path = evolution_trace_path or "evolution_trace.jsonl"
+            try:
+                run_context = json.loads(os.environ.get("RPENT_EVOLUTION_CONTEXT_JSON", "{}"))
+            except json.JSONDecodeError:
+                run_context = {}
             self._passive_trace = PassiveTraceWriter(
                 trace_path,
                 library_id=str(manifest["library_id"]),
+                run_context=run_context if isinstance(run_context, dict) else {},
             )
         self._register_common_tools()
 
@@ -227,12 +233,7 @@ class Toolkit:
         handler = entry[1]
         call_event_id = None
         if self._passive_trace is not None:
-            call_event_id = self._passive_trace.write(
-                "tool_call",
-                tool_name=name,
-                arguments=input_dict,
-                active_skill_ids=self._passive_trace.active_skill_ids,
-            )
+            call_event_id = self._passive_trace.record_tool_call(name, input_dict)
         try:
             result = handler(**input_dict)
         except TypeError as e:
@@ -242,14 +243,25 @@ class Toolkit:
         if self._dashboard is not None:
             self._dashboard.on_tool_result(name, result)
         if self._passive_trace is not None:
-            self._passive_trace.write(
-                "tool_result",
-                tool_name=name,
-                call_event_id=call_event_id,
-                result=result,
-                active_skill_ids=self._passive_trace.active_skill_ids,
-            )
+            self._passive_trace.record_tool_result(name, call_event_id, result)
         return ToolResult(name=name, result=result)
+
+    def record_model_turn(
+        self,
+        *,
+        message_index: int,
+        visible_text: str,
+        tool_uses: list[dict[str, Any]],
+        usage: dict[str, Any] | None = None,
+    ) -> None:
+        """Persist visible planner output without copying hidden thinking."""
+        if self._passive_trace is not None:
+            self._passive_trace.record_model_turn(
+                message_index=message_index,
+                visible_text=visible_text,
+                tool_uses=tool_uses,
+                usage=usage,
+            )
 
     def record_episode_outcome(
         self,

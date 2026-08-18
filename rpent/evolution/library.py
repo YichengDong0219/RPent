@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from rpent.evolution.schemas import SkillPatch
+from rpent.evolution.schemas import SkillOverlayPatch, SkillPatch
 
 MANIFEST_NAME = "library.json"
 MEMORY_DIR_NAME = "rendered_memory"
@@ -153,6 +153,67 @@ def apply_patch(
     except Exception:
         # The directory is a not-yet-published candidate.  Remove only this
         # exact path after validating it was newly created above.
+        shutil.rmtree(output)
+        raise
+    return output
+
+
+def apply_overlay(
+    parent_dir: str | Path,
+    patch: SkillOverlayPatch | dict[str, Any] | str | Path,
+    output_dir: str | Path,
+    *,
+    library_id: str,
+) -> Path:
+    """Materialize one routing replacement or one managed leaf append."""
+    parent = Path(parent_dir).resolve()
+    parent_manifest = load_manifest(parent)
+    if isinstance(patch, (str, Path)):
+        value = SkillOverlayPatch.model_validate_json(Path(patch).read_text())
+    elif isinstance(patch, dict):
+        value = SkillOverlayPatch.model_validate(patch)
+    else:
+        value = patch
+    output = Path(output_dir).resolve()
+    _assert_new_directory(output)
+    try:
+        shutil.copytree(parent / MEMORY_DIR_NAME, output / MEMORY_DIR_NAME)
+        target = _safe_target(output / MEMORY_DIR_NAME, value.target)
+        if not target.is_file():
+            raise ValueError(f"overlay target does not exist: {value.target}")
+        original = target.read_text()
+        if value.surface == "routing":
+            if original.count(value.old_text) != 1:
+                raise ValueError("routing overlay old_text must occur exactly once")
+            rendered = original.replace(value.old_text, value.new_text, 1)
+        else:
+            if value.old_text:
+                raise ValueError("leaf overlay is append-only and must not contain old_text")
+            if value.new_text.strip() in original:
+                raise ValueError("leaf overlay duplicates an existing managed record")
+            rendered = original.rstrip() + value.new_text
+        target.write_text(rendered)
+        overlay_dir = output / "overlays"
+        overlay_dir.mkdir()
+        _write_json(overlay_dir / f"{value.patch_id}.json", value.model_dump(mode="json"))
+        files = sorted(
+            str(path.relative_to(output))
+            for path in output.rglob("*")
+            if path.is_file() and path.name != MANIFEST_NAME
+        )
+        _write_json(
+            output / MANIFEST_NAME,
+            {
+                "schema_version": "SkillLibrary/v1",
+                "library_id": library_id,
+                "parent_library": parent_manifest["library_id"],
+                "created_at": _now(),
+                "source_memory": parent_manifest.get("source_memory"),
+                "patch": value.model_dump(mode="json"),
+                "files": files,
+            },
+        )
+    except Exception:
         shutil.rmtree(output)
         raise
     return output

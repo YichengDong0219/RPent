@@ -108,6 +108,7 @@ def build_planner(
     claude_code_max_budget_usd: float | None = None,
     dashboard: Any = None,
     no_images: bool = False,
+    sampling_seed: int | None = None,
 ):
     """Build a planner for the given backend, resolving credentials from env vars."""
     # Imports are deferred to avoid a circular import: api_loop / claude_code /
@@ -156,6 +157,7 @@ def build_planner(
             max_tokens=max_tokens,
             dashboard=dashboard,
             no_images=no_images,
+            sampling_seed=sampling_seed,
         )
     if planner_type == "claude_code":
         from rpent.planner.claude_code import ClaudeCodePlanner

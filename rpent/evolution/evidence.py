@@ -171,7 +171,7 @@ def build_optimizer_evidence(
     max_images: int = 6,
     max_turns: int | None = None,
 ) -> dict[str, Any]:
-    """Create one auditable OptimizerEvidence/v1 object."""
+    """Create one auditable RolloutEvidence/v2 object from factual artifacts."""
 
     root = Path(episode_dir).resolve()
     result = dict(rollout_result or _json(root / "result.json", {}))
@@ -180,6 +180,32 @@ def build_optimizer_evidence(
     states = [x for x in states_value if isinstance(x, dict)] if isinstance(states_value, list) else []
     events = _events(root)
     decisions, transcript_uses = _visible_decisions(transcript)
+
+    model_turns = [e for e in events if e.get("event_type") == "model_turn"]
+    if model_turns:
+        decisions, transcript_uses = [], []
+        for turn in model_turns:
+            uses = []
+            for item in turn.get("tool_uses", []):
+                if not isinstance(item, dict):
+                    continue
+                use = {
+                    "message_index": turn.get("message_index"),
+                    "tool_use_id": item.get("tool_use_id"),
+                    "tool": item.get("tool"),
+                    "arguments": item.get("arguments", {}),
+                    "trace_event_id": None,
+                    "matched": False,
+                }
+                uses.append(use)
+                transcript_uses.append(use)
+            decisions.append({
+                "message_index": turn.get("message_index"),
+                "visible_text": str(turn.get("visible_text", "")),
+                "explicit_skill_references": [],
+                "tool_calls": uses,
+                "source_event_id": turn.get("event_id"),
+            })
 
     calls = [e for e in events if e.get("event_type") == "tool_call"]
     results_by_call = {
@@ -208,6 +234,7 @@ def build_optimizer_evidence(
                     "skill_id": event.get("skill_id"),
                     "event_id": event.get("event_id"),
                     "path": event.get("memory_path"),
+                    "before_first_physical_action": event.get("before_first_physical_action"),
                 }
             )
     for call in calls:
@@ -260,6 +287,7 @@ def build_optimizer_evidence(
             "arguments": call.get("arguments", {}),
             "call_event_id": call.get("event_id"),
             "result_event_id": result_event.get("event_id"),
+            "action_ordinal": call.get("action_ordinal"),
             "active_skill_ids": call.get("active_skill_ids", []),
             "step_before": step_before,
             "step_after": step_after,
@@ -299,20 +327,30 @@ def build_optimizer_evidence(
     images = _select_images(actions, observations, max(0, max_images))
     for action in actions:
         action.pop("raw_result", None)
-    run_id = str(result.get("case_id") or root.name)
+    context = next((event for event in events if event.get("schema_version") == "EvolutionTraceEvent/v2"), {})
+    run_id = str(context.get("run_id") or result.get("case_id") or root.name)
     library_id = next((e.get("library_id") for e in events if e.get("library_id")), None)
     return {
-        "schema_version": "OptimizerEvidence/v1",
+        "schema_version": "RolloutEvidence/v2",
         "identity": {
             "run_id": run_id,
-            "suite": result.get("suite", transcript.get("suite")),
-            "task": result.get("task", transcript.get("task")),
-            "seed": result.get("seed", transcript.get("seed")),
+            "suite": context.get("suite", result.get("suite", transcript.get("suite"))),
+            "task": context.get("task", result.get("task", transcript.get("task"))),
+            "seed": context.get("seed", result.get("seed", transcript.get("seed"))),
+            "repeat": context.get("repeat", result.get("repeat", 0)),
+            "planner_sampling_seed": context.get("planner_sampling_seed"),
+            "reset_identity": context.get("reset_identity"),
             "task_language": next((s.get("task_language") for s in states if s.get("task_language")), None),
             "library_id": library_id,
             "library": result.get("library", transcript.get("skill_library")),
-            "planner_model": transcript.get("model"),
+            "planner_model": context.get("planner_version", transcript.get("model")),
+            "vla_version": context.get("vla_version"),
             "vla_endpoint": result.get("vla_endpoint"),
+            "causal_pairing_eligible": bool(
+                context.get("run_id")
+                and context.get("planner_sampling_seed") is not None
+                and context.get("reset_identity")
+            ),
         },
         "outcome": {
             "valid_benchmark_outcome": valid_status,
@@ -366,4 +404,75 @@ def aggregate_evidence(evidence: list[dict[str, Any]]) -> dict[str, Any]:
     groups = {(x.get("identity", {}).get("suite"), x.get("identity", {}).get("task")) for x in evidence}
     if len(groups) != 1:
         raise ValueError("optimizer evidence must cover exactly one suite/task")
-    return {"schema_version": "OptimizerEvidenceBatch/v1", "rollouts": evidence}
+    return {"schema_version": "RolloutEvidenceBatch/v2", "rollouts": evidence}
+
+
+def skill_usage_records(rollout: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Derive auditable read/reference/action attribution without exposing thinking text."""
+
+    first_physical = rollout.get("routing", {}).get("first_physical_event_id")
+    leaf_reads = rollout.get("routing", {}).get("leaf_reads", [])
+    skill_ids = sorted({
+        str(item.get("skill_id")) for item in leaf_reads if item.get("skill_id")
+    })
+    actions_by_event = {
+        item.get("call_event_id"): item
+        for item in rollout.get("actions", [])
+        if isinstance(item, dict) and item.get("call_event_id") is not None
+    }
+    def message_index(item: dict[str, Any]) -> int:
+        value = item.get("message_index")
+        return value if isinstance(value, int) else 10**9
+
+    decisions = sorted(
+        (item for item in rollout.get("decisions", []) if isinstance(item, dict)),
+        key=message_index,
+    )
+    records: dict[str, dict[str, Any]] = {}
+    for skill_id in skill_ids:
+        reads = [item for item in leaf_reads if str(item.get("skill_id")) == skill_id]
+        read_before = bool(first_physical) and any(
+            isinstance(item.get("event_id"), int) and item["event_id"] < first_physical
+            for item in reads
+        )
+        reference_messages = [
+            int(item["message_index"])
+            for item in decisions
+            if isinstance(item.get("message_index"), int)
+            and skill_id in item.get("explicit_skill_references", [])
+        ]
+        visible_reference = any(
+            skill_id in item.get("explicit_skill_references", []) for item in decisions
+        )
+        first_attributed_action = None
+        if reference_messages:
+            first_reference = min(reference_messages)
+            for decision in decisions:
+                if message_index(decision) < first_reference:
+                    continue
+                for call in decision.get("tool_calls", []):
+                    event_id = call.get("trace_event_id")
+                    action = actions_by_event.get(event_id)
+                    if (
+                        action is not None
+                        and skill_id in action.get("active_skill_ids", [])
+                    ):
+                        first_attributed_action = {
+                            "message_index": decision.get("message_index"),
+                            "call_event_id": event_id,
+                            "tool": action.get("tool"),
+                            "arguments": action.get("arguments", {}),
+                        }
+                        break
+                if first_attributed_action is not None:
+                    break
+        records[skill_id] = {
+            "skill_id": skill_id,
+            "read_before_first_physical": read_before,
+            "explicitly_referenced": visible_reference,
+            "visible_reference": visible_reference,
+            "reference_message_indices": sorted(set(reference_messages)),
+            "first_attributed_action": first_attributed_action,
+            "used": bool(read_before and visible_reference and first_attributed_action),
+        }
+    return records

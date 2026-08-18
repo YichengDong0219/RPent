@@ -101,6 +101,8 @@ def _build_argparser() -> argparse.ArgumentParser:
                     help="API base URL. Defaults to the selected backend's base URL env var.")
     ap.add_argument("--max-turns", type=int, default=100)
     ap.add_argument("--max-tokens", type=int, default=8192)
+    ap.add_argument("--planner-sampling-seed", type=int, default=None,
+                    help="Optional API sampling seed recorded and paired by skill evolution.")
     ap.add_argument("--no-images", action="store_true",
                     help="Never send image bytes to the model (api planner only). "
                          "Use for text-only models that reject image input "
@@ -223,6 +225,7 @@ def main() -> int:
         claude_code_max_budget_usd=args.claude_code_max_budget_usd,
         dashboard=dashboard_state,
         no_images=args.no_images,
+        sampling_seed=args.planner_sampling_seed,
     )
     prompt_bundle = env_spec.prompts
 

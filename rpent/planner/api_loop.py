@@ -61,12 +61,14 @@ class ApiAgentLoop:
         max_tokens: int = 8192,
         dashboard: Any = None,
         no_images: bool = False,
+        sampling_seed: int | None = None,
     ):
         """Store the pydantic-ai model and the output-token cap."""
         self._model = model
         self._max_tokens = max_tokens
         self._dashboard = dashboard
         self._no_images = no_images
+        self._sampling_seed = sampling_seed
 
     def solve(
         self,
@@ -101,7 +103,9 @@ class ApiAgentLoop:
             self._model,
             instructions=system_prompt or None,
             tools=_build_tools(toolkit, no_images=self._no_images),
-            model_settings=_build_model_settings(self._model, self._max_tokens),
+            model_settings=_build_model_settings(
+                self._model, self._max_tokens, self._sampling_seed
+            ),
             capabilities=[
                 Thinking(effort="high"),
                 ProcessHistory(processor=_prune_history_images),
@@ -176,6 +180,29 @@ class ApiAgentLoop:
                             response = node.model_response
                             response_message = _serialize_response(response)
                             messages.append(response_message)
+                            visible_text = "\n".join(
+                                str(block.get("text", ""))
+                                for block in response_message.get("content", [])
+                                if isinstance(block, dict) and block.get("type") == "text"
+                            ).strip()
+                            tool_uses = [
+                                {
+                                    "tool_use_id": block.get("id"),
+                                    "tool": block.get("name"),
+                                    "arguments": block.get("input", {}),
+                                }
+                                for block in response_message.get("content", [])
+                                if isinstance(block, dict) and block.get("type") == "tool_use"
+                            ]
+                            toolkit.record_model_turn(
+                                message_index=len(messages) - 1,
+                                visible_text=visible_text,
+                                tool_uses=tool_uses,
+                                usage={
+                                    "input_tokens": int(run.usage.input_tokens or 0),
+                                    "output_tokens": int(run.usage.output_tokens or 0),
+                                },
+                            )
                             _log_response(response, run.usage, run_turns, max_turns)
                             if self._dashboard is not None:
                                 for block in response_message["content"]:
@@ -304,18 +331,26 @@ class ApiAgentLoop:
         )
 
 
-def _build_model_settings(model: Model, max_tokens: int) -> ModelSettings:
+def _build_model_settings(
+    model: Model, max_tokens: int, sampling_seed: int | None = None
+) -> ModelSettings:
     """Build model settings, enabling prompt caching for Anthropic models."""
     from pydantic_ai.models.anthropic import AnthropicModel, AnthropicModelSettings
 
     if isinstance(model, AnthropicModel):
-        return AnthropicModelSettings(
+        settings = AnthropicModelSettings(
             max_tokens=max_tokens,
             anthropic_cache_instructions=True,
             anthropic_cache_tool_definitions=True,
             anthropic_cache_messages=True,
         )
-    return ModelSettings(max_tokens=max_tokens)
+        if sampling_seed is not None:
+            settings["seed"] = sampling_seed
+        return settings
+    settings = ModelSettings(max_tokens=max_tokens)
+    if sampling_seed is not None:
+        settings["seed"] = sampling_seed
+    return settings
 
 
 def _prune_history_images(messages: list[ModelMessage]) -> list[ModelMessage]:

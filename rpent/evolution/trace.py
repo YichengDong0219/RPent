@@ -1,12 +1,18 @@
-"""Passive, append-only tracing for unchanged baseline tool calls."""
+"""Append-only factual tracing for baseline-compatible evolution runs."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+PHYSICAL_TOOLS = {
+    "move_to", "pi0_pick", "pi0_doubled", "release", "set_gripper",
+    "rotate_wrist", "rotate_pitch", "move_pose",
+}
 
 
 def _json_safe(value: Any) -> Any:
@@ -21,16 +27,57 @@ def _json_safe(value: Any) -> Any:
     return str(value)
 
 
-class PassiveTraceWriter:
-    """Thread-safe event writer that never gates or modifies an action."""
+def _bounded_file_result(tool_name: str, result: Any) -> Any:
+    """Do not duplicate large MEMORY contents in the factual event stream."""
+    if tool_name != "read_text_file" or not isinstance(result, dict):
+        return _json_safe(result)
+    bounded = {key: value for key, value in result.items() if key not in {"content", "text", "data"}}
+    for key in ("content", "text", "data"):
+        value = result.get(key)
+        if isinstance(value, str):
+            bounded["source_chars"] = len(value)
+            bounded["source_sha256"] = hashlib.sha256(value.encode()).hexdigest()
+            break
+    return _json_safe(bounded)
 
-    def __init__(self, path: str | Path, *, library_id: str) -> None:
+
+class PassiveTraceWriter:
+    """Thread-safe v2 writer that observes but never gates an action."""
+
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        library_id: str,
+        run_context: dict[str, Any] | None = None,
+    ) -> None:
         self.path = Path(path).resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.library_id = library_id
+        self.run_context = _json_safe(run_context or {})
         self._lock = threading.Lock()
-        self._next_event_id = 1
+        self._next_event_id = self._existing_event_count() + 1
         self._active_skill_ids: list[str] = []
+        self._physical_action_ordinal = 0
+        self.write(
+            "episode_start",
+            reset_identity=self.run_context.get("reset_identity"),
+            planner_version=self.run_context.get("planner_version"),
+            vla_version=self.run_context.get("vla_version"),
+        )
+
+    def _existing_event_count(self) -> int:
+        if not self.path.is_file():
+            return 0
+        count = 0
+        for line in self.path.read_text(errors="replace").splitlines():
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, dict) and isinstance(value.get("event_id"), int):
+                count = max(count, int(value["event_id"]))
+        return count
 
     @property
     def active_skill_ids(self) -> list[str]:
@@ -44,18 +91,68 @@ class PassiveTraceWriter:
         with self._lock:
             if skill_id not in self._active_skill_ids:
                 self._active_skill_ids.append(skill_id)
-        self.write("skill_read", skill_id=skill_id, memory_path=relative_path)
+            before_first_action = self._physical_action_ordinal == 0
+        self.write(
+            "skill_read",
+            skill_id=skill_id,
+            memory_path=relative_path,
+            before_first_physical_action=before_first_action,
+        )
+
+    def record_model_turn(
+        self,
+        *,
+        message_index: int,
+        visible_text: str,
+        tool_uses: list[dict[str, Any]],
+        usage: dict[str, Any] | None = None,
+    ) -> int:
+        return self.write(
+            "model_turn",
+            message_index=message_index,
+            visible_text=visible_text,
+            tool_uses=tool_uses,
+            usage=usage or {},
+            active_skill_ids=self.active_skill_ids,
+        )
+
+    def record_tool_call(self, tool_name: str, arguments: dict[str, Any]) -> int:
+        physical = tool_name in PHYSICAL_TOOLS
+        with self._lock:
+            if physical:
+                self._physical_action_ordinal += 1
+                action_ordinal = self._physical_action_ordinal
+            else:
+                action_ordinal = None
+        return self.write(
+            "tool_call",
+            tool_name=tool_name,
+            arguments=arguments,
+            physical=physical,
+            action_ordinal=action_ordinal,
+            active_skill_ids=self.active_skill_ids,
+        )
+
+    def record_tool_result(self, tool_name: str, call_event_id: int | None, result: Any) -> int:
+        return self.write(
+            "tool_result",
+            tool_name=tool_name,
+            call_event_id=call_event_id,
+            result=_bounded_file_result(tool_name, result),
+            active_skill_ids=self.active_skill_ids,
+        )
 
     def write(self, event_type: str, **payload: Any) -> int:
         with self._lock:
             event_id = self._next_event_id
             self._next_event_id += 1
             record = {
-                "schema_version": "PassiveTraceEvent/v1",
+                "schema_version": "EvolutionTraceEvent/v2",
                 "event_id": event_id,
                 "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
                 "event_type": event_type,
                 "library_id": self.library_id,
+                **self.run_context,
                 **_json_safe(payload),
             }
             with self.path.open("a", encoding="utf-8") as handle:

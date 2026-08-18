@@ -9,7 +9,15 @@ from typing import Any
 
 from rpent.evolution.admission import decide_admission, decide_windowed_admission
 from rpent.evolution.evidence import build_optimizer_evidence
+from rpent.evolution.failure_fix import build_batch_artifacts
+from rpent.evolution.failure_optimizer import (
+    compile_overlay_patch,
+    diagnose_failures,
+    shadow_check,
+    write_skill_update,
+)
 from rpent.evolution.library import (
+    apply_overlay,
     apply_patch,
     create_snapshot,
     load_manifest,
@@ -21,7 +29,11 @@ from rpent.evolution.optimizer import (
     validate_optimizer_decision,
 )
 from rpent.evolution.rollout import summarize_rollout
-from rpent.evolution.schemas import SkillOptimizationDecision
+from rpent.evolution.schemas import (
+    SkillFailureDiagnosis,
+    SkillOptimizationDecision,
+    SkillUpdateIntent,
+)
 
 
 def _write(path: str | Path, value: Any) -> None:
@@ -58,6 +70,12 @@ def _parser() -> argparse.ArgumentParser:
     apply.add_argument("--output", required=True)
     apply.add_argument("--library-id", required=True)
 
+    overlay = sub.add_parser("apply-overlay")
+    overlay.add_argument("--parent", required=True)
+    overlay.add_argument("--patch", required=True)
+    overlay.add_argument("--output", required=True)
+    overlay.add_argument("--library-id", required=True)
+
     record = sub.add_parser("record-rollout")
     record.add_argument("--episode-dir", required=True)
     record.add_argument("--case-id", required=True)
@@ -78,13 +96,55 @@ def _parser() -> argparse.ArgumentParser:
     propose.add_argument("--base-url", required=True)
     propose.add_argument("--api-key", default="EMPTY")
     propose.add_argument("--model", required=True)
-    propose.add_argument("--max-tokens", type=int, default=8192)
+    propose.add_argument("--max-tokens", type=int, default=24576)
     propose.add_argument("--timeout-s", type=int, default=600)
     propose.add_argument("--max-patch-lines", type=int, default=24)
     propose.add_argument("--max-patch-new-chars", type=int, default=2000)
     propose.add_argument("--max-patch-growth-chars", type=int, default=1000)
     propose.add_argument("--response-file", default=None)
     propose.add_argument("--output", required=True)
+
+    batch = sub.add_parser("build-batch-evidence")
+    batch.add_argument("--evidence", action="append", required=True)
+    batch.add_argument("--min-failure-support", type=int, default=2)
+    batch.add_argument("--min-success-references", type=int, default=1)
+    batch.add_argument("--output", required=True)
+
+    diagnose = sub.add_parser("diagnose-failures")
+    diagnose.add_argument("--evidence", action="append", required=True)
+    diagnose.add_argument("--batch-artifacts", required=True)
+    diagnose.add_argument("--library", required=True)
+    diagnose.add_argument("--skill-path", required=True)
+    diagnose.add_argument("--feedback", default=None)
+    diagnose.add_argument("--base-url", required=True)
+    diagnose.add_argument("--api-key", default="EMPTY")
+    diagnose.add_argument("--model", required=True)
+    diagnose.add_argument("--max-tokens", type=int, default=24576)
+    diagnose.add_argument("--timeout-s", type=int, default=600)
+    diagnose.add_argument("--max-images", type=int, default=6)
+    diagnose.add_argument("--output", required=True)
+
+    writer = sub.add_parser("write-skill-update")
+    writer.add_argument("--diagnosis", required=True)
+    writer.add_argument("--evidence", action="append", required=True)
+    writer.add_argument("--batch-artifacts", required=True)
+    writer.add_argument("--library", required=True)
+    writer.add_argument("--skill-path", required=True)
+    writer.add_argument("--base-url", required=True)
+    writer.add_argument("--api-key", default="EMPTY")
+    writer.add_argument("--model", required=True)
+    writer.add_argument("--max-tokens", type=int, default=24576)
+    writer.add_argument("--timeout-s", type=int, default=600)
+    writer.add_argument("--output", required=True)
+
+    shadow = sub.add_parser("shadow-check")
+    shadow.add_argument("--diagnosis", required=True)
+    shadow.add_argument("--intent", required=True)
+    shadow.add_argument("--batch-artifacts", required=True)
+    shadow.add_argument("--evidence", action="append", required=True)
+    shadow.add_argument("--library", required=True)
+    shadow.add_argument("--minimum-failure-hits", type=int, default=2)
+    shadow.add_argument("--output", required=True)
 
     check = sub.add_parser("check-optimizer")
     check.add_argument("--base-url", required=True)
@@ -105,6 +165,9 @@ def _parser() -> argparse.ArgumentParser:
     windowed.add_argument("--feedback", action="append", required=True)
     windowed.add_argument("--minimum-activations", type=int, default=2)
     windowed.add_argument("--output", required=True)
+    causal = sub.add_parser("admit-causal")
+    causal.add_argument("--feedback", action="append", required=True)
+    causal.add_argument("--output", required=True)
     return parser
 
 
@@ -119,6 +182,9 @@ def main() -> int:
         print(json.dumps({**manifest, "rendered_memory": str(memory)}, ensure_ascii=False, indent=2))
     elif args.command == "apply-patch":
         path = apply_patch(args.parent, args.patch, args.output, library_id=args.library_id)
+        print(json.dumps(load_manifest(path), ensure_ascii=False, indent=2))
+    elif args.command == "apply-overlay":
+        path = apply_overlay(args.parent, args.patch, args.output, library_id=args.library_id)
         print(json.dumps(load_manifest(path), ensure_ascii=False, indent=2))
     elif args.command == "record-rollout":
         value = summarize_rollout(
@@ -176,6 +242,70 @@ def main() -> int:
             )
         _write(args.output, decision.model_dump(mode="json"))
         print(decision.model_dump_json(indent=2))
+    elif args.command == "build-batch-evidence":
+        value = build_batch_artifacts(
+            _load_many(args.evidence),
+            min_failure_support=args.min_failure_support,
+            min_success_references=args.min_success_references,
+        )
+        _write(args.output, value)
+        print(json.dumps(value, ensure_ascii=False, indent=2))
+    elif args.command == "diagnose-failures":
+        evidence = _load_many(args.evidence)
+        batch_value = json.loads(Path(args.batch_artifacts).read_text())
+        feedback = json.loads(Path(args.feedback).read_text()) if args.feedback else None
+        value = diagnose_failures(
+            evidence=evidence,
+            batch_artifacts=batch_value,
+            memory_dir=rendered_memory_dir(args.library),
+            skill_path=args.skill_path,
+            feedback=feedback,
+            base_url=args.base_url,
+            api_key=args.api_key,
+            model=args.model,
+            output_dir=Path(args.output).parent,
+            max_tokens=args.max_tokens,
+            timeout_s=args.timeout_s,
+            max_images=args.max_images,
+        )
+        _write(args.output, value.model_dump(mode="json"))
+        print(value.model_dump_json(indent=2))
+    elif args.command == "write-skill-update":
+        diagnosis = SkillFailureDiagnosis.model_validate_json(Path(args.diagnosis).read_text())
+        value = write_skill_update(
+            diagnosis=diagnosis,
+            evidence=_load_many(args.evidence),
+            batch_artifacts=json.loads(Path(args.batch_artifacts).read_text()),
+            memory_dir=rendered_memory_dir(args.library),
+            skill_path=args.skill_path,
+            base_url=args.base_url,
+            api_key=args.api_key,
+            model=args.model,
+            output_dir=Path(args.output).parent,
+            max_tokens=args.max_tokens,
+            timeout_s=args.timeout_s,
+        )
+        _write(args.output, value.model_dump(mode="json"))
+        print(value.model_dump_json(indent=2))
+    elif args.command == "shadow-check":
+        diagnosis = SkillFailureDiagnosis.model_validate_json(Path(args.diagnosis).read_text())
+        intent = SkillUpdateIntent.model_validate_json(Path(args.intent).read_text())
+        batch_value = json.loads(Path(args.batch_artifacts).read_text())
+        evidence = _load_many(args.evidence)
+        overlay_value = compile_overlay_patch(
+            diagnosis=diagnosis,
+            intent=intent,
+            batch_artifacts=batch_value,
+            memory_dir=rendered_memory_dir(args.library),
+        )
+        value = shadow_check(
+            overlay_value,
+            evidence=evidence,
+            minimum_failure_hits=args.minimum_failure_hits,
+        )
+        output = {"overlay_patch": overlay_value.model_dump(mode="json"), "shadow": value.model_dump(mode="json")}
+        _write(args.output, output)
+        print(json.dumps(output, ensure_ascii=False, indent=2))
     elif args.command == "check-optimizer":
         check_optimizer_service(
             base_url=args.base_url,
@@ -200,6 +330,10 @@ def main() -> int:
             _load_many(args.feedback),
             minimum_activations=args.minimum_activations,
         )
+        _write(args.output, decision.to_dict())
+        print(json.dumps(decision.to_dict(), ensure_ascii=False, indent=2))
+    elif args.command == "admit-causal":
+        decision = decide_windowed_admission(_load_many(args.feedback))
         _write(args.output, decision.to_dict())
         print(json.dumps(decision.to_dict(), ensure_ascii=False, indent=2))
     return 0
