@@ -21,7 +21,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 import queue
 import shlex
 import sys
@@ -234,6 +236,24 @@ def main() -> int:
         "system",
         variables=prompt_vars,
     )
+    if args.skill_library:
+        from rpent.evolution.trace import EVOLUTION_DECISION_PROTOCOL
+
+        system_prompt = f"{system_prompt.rstrip()}\n\n{EVOLUTION_DECISION_PROTOCOL}\n"
+        try:
+            evolution_context = json.loads(
+                os.environ.get("RPENT_EVOLUTION_CONTEXT_JSON", "{}")
+            )
+        except json.JSONDecodeError:
+            evolution_context = {}
+        if not isinstance(evolution_context, dict):
+            evolution_context = {}
+        evolution_context["system_prompt_sha256"] = hashlib.sha256(
+            system_prompt.encode()
+        ).hexdigest()
+        os.environ["RPENT_EVOLUTION_CONTEXT_JSON"] = json.dumps(
+            evolution_context, separators=(",", ":")
+        )
     user_msg = prompt_bundle.render(
         "user",
         variables=prompt_vars,

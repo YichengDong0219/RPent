@@ -17,6 +17,11 @@ FailureLayer = Literal[
 FixKind = Literal["prevention", "recovery"]
 PatchSurface = Literal["routing", "leaf"]
 WindowPhase = Literal["proposal", "forward", "retention"]
+DecisionPhase = Literal["initial", "replan", "recovery", "stop"]
+SkillRejectionReason = Literal[
+    "scope_mismatch", "semantic_mismatch", "instruction_conflict",
+    "tool_unavailable", "lower_preference",
+]
 PairClass = Literal[
     "causal_prevention", "causal_recovery", "incidental_success", "regression",
     "fix_ineffective", "no_intervention", "stable_success", "unresolved_failure",
@@ -29,6 +34,47 @@ class EvidenceRef(BaseModel):
     message_indices: list[int] = Field(default_factory=list)
     image_ids: list[str] = Field(default_factory=list)
     note: str = ""
+
+
+class RejectedSkillDecision(BaseModel):
+    skill_id: str = Field(min_length=1, max_length=128)
+    reason_code: SkillRejectionReason
+
+
+class PlannerDecisionCapsule(BaseModel):
+    """Compact, non-authoritative planner intent recorded during a rollout."""
+
+    schema_version: Literal["PlannerDecisionCapsule/v1"] = "PlannerDecisionCapsule/v1"
+    phase: DecisionPhase
+    candidate_skill_ids: list[str] = Field(default_factory=list, max_length=8)
+    selected_skill_id: str | None = Field(default=None, max_length=128)
+    rejected_skills: list[RejectedSkillDecision] = Field(default_factory=list, max_length=8)
+    intended_skill_step: str = Field(default="", max_length=240)
+    action_intent: str = Field(min_length=1, max_length=240)
+    expected_observation: str = Field(default="", max_length=240)
+    replan_trigger: str | None = Field(default=None, max_length=240)
+    evidence_event_ids: list[int] = Field(default_factory=list, max_length=16)
+    authoritative: Literal[False] = False
+
+    @model_validator(mode="after")
+    def validate_capsule(self) -> "PlannerDecisionCapsule":
+        candidates = list(dict.fromkeys(self.candidate_skill_ids))
+        if len(candidates) != len(self.candidate_skill_ids):
+            raise ValueError("candidate_skill_ids must be unique")
+        rejected = [item.skill_id for item in self.rejected_skills]
+        if len(set(rejected)) != len(rejected):
+            raise ValueError("rejected skill IDs must be unique")
+        if self.selected_skill_id and self.selected_skill_id not in candidates:
+            raise ValueError("selected skill must occur in candidate_skill_ids")
+        if self.selected_skill_id and self.selected_skill_id in rejected:
+            raise ValueError("selected skill cannot also be rejected")
+        if not set(rejected).issubset(set(candidates)):
+            raise ValueError("rejected skills must occur in candidate_skill_ids")
+        if self.phase in {"replan", "recovery"} and not self.replan_trigger:
+            raise ValueError("replan/recovery capsule requires replan_trigger")
+        if any(event_id <= 0 for event_id in self.evidence_event_ids):
+            raise ValueError("evidence_event_ids must be positive")
+        return self
 
 
 class SkillPatch(BaseModel):
@@ -87,8 +133,12 @@ class SkillFailureDiagnosis(BaseModel):
     observed_outcome: str
     immediate_trigger: str
     earliest_divergence: dict[str, Any] = Field(default_factory=dict)
+    causal_chain: list[str] = Field(default_factory=list)
     root_cause_hypothesis: str
     competing_hypotheses: list[str] = Field(default_factory=list)
+    planner_intent_evidence: list[EvidenceRef] = Field(default_factory=list)
+    runtime_evidence: list[EvidenceRef] = Field(default_factory=list)
+    recommended_intervention: dict[str, Any] = Field(default_factory=dict)
     fix_kind: FixKind | None = None
     failure_run_ids: list[str] = Field(default_factory=list)
     success_reference_ids: list[str] = Field(default_factory=list)

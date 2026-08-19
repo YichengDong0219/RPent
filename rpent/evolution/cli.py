@@ -122,6 +122,8 @@ def _parser() -> argparse.ArgumentParser:
     diagnose.add_argument("--max-tokens", type=int, default=24576)
     diagnose.add_argument("--timeout-s", type=int, default=600)
     diagnose.add_argument("--max-images", type=int, default=6)
+    diagnose.add_argument("--max-attempts", type=int, default=3)
+    diagnose.add_argument("--contrast-id", default=None)
     diagnose.add_argument("--output", required=True)
 
     writer = sub.add_parser("write-skill-update")
@@ -135,6 +137,8 @@ def _parser() -> argparse.ArgumentParser:
     writer.add_argument("--model", required=True)
     writer.add_argument("--max-tokens", type=int, default=24576)
     writer.add_argument("--timeout-s", type=int, default=600)
+    writer.add_argument("--max-attempts", type=int, default=3)
+    writer.add_argument("--contrast-id", default=None)
     writer.add_argument("--output", required=True)
 
     shadow = sub.add_parser("shadow-check")
@@ -144,6 +148,7 @@ def _parser() -> argparse.ArgumentParser:
     shadow.add_argument("--evidence", action="append", required=True)
     shadow.add_argument("--library", required=True)
     shadow.add_argument("--minimum-failure-hits", type=int, default=2)
+    shadow.add_argument("--contrast-id", default=None)
     shadow.add_argument("--output", required=True)
 
     check = sub.add_parser("check-optimizer")
@@ -198,7 +203,10 @@ def main() -> int:
             rollout_result=value,
         )
         _write(evidence_path, evidence)
+        summary_path = Path(args.episode_dir) / "execution_summary.json"
+        _write(summary_path, evidence["execution_summary"])
         value["optimizer_evidence"] = str(evidence_path.resolve())
+        value["execution_summary"] = str(summary_path.resolve())
         _write(args.output, value)
         print(json.dumps(value, ensure_ascii=False, indent=2))
     elif args.command == "build-evidence":
@@ -267,6 +275,8 @@ def main() -> int:
             max_tokens=args.max_tokens,
             timeout_s=args.timeout_s,
             max_images=args.max_images,
+            max_attempts=args.max_attempts,
+            contrast_id=args.contrast_id,
         )
         _write(args.output, value.model_dump(mode="json"))
         print(value.model_dump_json(indent=2))
@@ -284,6 +294,8 @@ def main() -> int:
             output_dir=Path(args.output).parent,
             max_tokens=args.max_tokens,
             timeout_s=args.timeout_s,
+            max_attempts=args.max_attempts,
+            contrast_id=args.contrast_id,
         )
         _write(args.output, value.model_dump(mode="json"))
         print(value.model_dump_json(indent=2))
@@ -297,6 +309,7 @@ def main() -> int:
             intent=intent,
             batch_artifacts=batch_value,
             memory_dir=rendered_memory_dir(args.library),
+            contrast_id=args.contrast_id,
         )
         value = shadow_check(
             overlay_value,

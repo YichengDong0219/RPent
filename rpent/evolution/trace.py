@@ -14,6 +14,19 @@ PHYSICAL_TOOLS = {
     "rotate_wrist", "rotate_pitch", "move_pose",
 }
 
+MAX_DECISION_CAPSULES = 8
+
+EVOLUTION_DECISION_PROTOCOL = """
+EVOLUTION INTENT TRACE (non-authoritative):
+- After reading MEMORY/leaf skills and before the first physical action, call
+  record_strategy_decision once with phase=initial.
+- Call it again only when changing the main strategy, entering recovery, or
+  voluntarily stopping. Do not repeat every primitive: runtime records tools.
+- Select only a leaf you actually read. Keep each explanation short and cite
+  only event IDs returned in this episode. This declaration never determines
+  benchmark success; only libero_terminated does.
+""".strip()
+
 
 def _json_safe(value: Any) -> Any:
     if isinstance(value, bytes):
@@ -59,6 +72,9 @@ class PassiveTraceWriter:
         self._next_event_id = self._existing_event_count() + 1
         self._active_skill_ids: list[str] = []
         self._physical_action_ordinal = 0
+        self._capsule_count = 0
+        self._current_capsule_id: int | None = None
+        self._current_capsule_status: str | None = None
         self.write(
             "episode_start",
             reset_identity=self.run_context.get("reset_identity"),
@@ -122,8 +138,20 @@ class PassiveTraceWriter:
             if physical:
                 self._physical_action_ordinal += 1
                 action_ordinal = self._physical_action_ordinal
+                capsule_id = self._current_capsule_id
+                capsule_status = self._current_capsule_status
             else:
                 action_ordinal = None
+                capsule_id = None
+                capsule_status = None
+        if physical and capsule_status != "valid":
+            self.write(
+                "undeclared_strategy",
+                reason="missing_capsule" if capsule_id is None else "invalid_capsule",
+                physical_tool=tool_name,
+                action_ordinal=action_ordinal,
+                capsule_id=capsule_id,
+            )
         return self.write(
             "tool_call",
             tool_name=tool_name,
@@ -131,7 +159,61 @@ class PassiveTraceWriter:
             physical=physical,
             action_ordinal=action_ordinal,
             active_skill_ids=self.active_skill_ids,
+            capsule_id=capsule_id,
+            capsule_validation_status=capsule_status,
         )
+
+    def record_decision_capsule(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Validate and record compact planner intent without gating execution."""
+        from pydantic import ValidationError
+
+        from rpent.evolution.schemas import PlannerDecisionCapsule
+
+        with self._lock:
+            next_event_id = self._next_event_id
+            over_limit = self._capsule_count >= MAX_DECISION_CAPSULES
+        errors: list[str] = []
+        capsule = None
+        try:
+            capsule = PlannerDecisionCapsule.model_validate(payload)
+        except ValidationError as exc:
+            errors.append(str(exc))
+        if capsule is not None:
+            unread = sorted(
+                skill_id
+                for skill_id in [capsule.selected_skill_id]
+                if skill_id and skill_id not in self.active_skill_ids
+            )
+            if unread:
+                errors.append(f"selected skill was not read: {unread}")
+            future = sorted(
+                event_id for event_id in capsule.evidence_event_ids
+                if event_id >= next_event_id
+            )
+            if future:
+                errors.append(f"evidence event IDs are not earlier events: {future}")
+        if over_limit:
+            errors.append(f"at most {MAX_DECISION_CAPSULES} decision capsules are allowed")
+
+        status = "valid" if not errors else "invalid"
+        capsule_value = capsule.model_dump(mode="json") if capsule is not None else _json_safe(payload)
+        event_id = self.write(
+            "planner_decision_capsule",
+            capsule=capsule_value,
+            validation_status=status,
+            validation_errors=errors,
+            authoritative=False,
+        )
+        with self._lock:
+            self._capsule_count += 1
+            self._current_capsule_id = event_id
+            self._current_capsule_status = status
+        return {
+            "capsule_id": event_id,
+            "validation_status": status,
+            "validation_errors": errors,
+            "authoritative": False,
+        }
 
     def record_tool_result(self, tool_name: str, call_event_id: int | None, result: Any) -> int:
         return self.write(

@@ -5,11 +5,13 @@ from __future__ import annotations
 import base64
 import json
 import mimetypes
+import os
 import re
 import struct
 import urllib.error
 import urllib.request
 import zlib
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, TypeVar
 
@@ -22,6 +24,7 @@ THINKING_TOP_P = 0.95
 THINKING_TOP_K = 20
 THINKING_PRESENCE_PENALTY = 1.5
 DEFAULT_OPTIMIZER_MAX_TOKENS = 24576
+DEFAULT_OPTIMIZER_MAX_ATTEMPTS = 3
 
 KNOWN_TOOLS = {
     "read_text_file", "write_text_file", "list_dir", "read_image",
@@ -107,7 +110,7 @@ def _red_png_data_url(size: int = 64) -> str:
 
 
 def _thinking_request(*, model: str, messages: list[dict[str, Any]], max_tokens: int) -> dict[str, Any]:
-    return {
+    body = {
         "model": model,
         "messages": messages,
         "temperature": THINKING_TEMPERATURE,
@@ -116,17 +119,38 @@ def _thinking_request(*, model: str, messages: list[dict[str, Any]], max_tokens:
         "presence_penalty": THINKING_PRESENCE_PENALTY,
         "max_tokens": max_tokens,
         "response_format": {"type": "json_object"},
-        "chat_template_kwargs": {"enable_thinking": True},
     }
+    if os.environ.get("RPENT_OPTIMIZER_REQUEST_MODE") == "qwen_api":
+        # DashScope's OpenAI-compatible endpoint does not consume vLLM's
+        # chat_template_kwargs. Qwen API thinking controls live at the body
+        # top level alongside model/messages.
+        body["enable_thinking"] = True
+    else:
+        # Preserve the existing self-hosted Qwen/vLLM request format.
+        body["chat_template_kwargs"] = {"enable_thinking": True}
+    return body
 
 
-def _repair_message(error: str, schema: dict[str, Any], previous_content: Any) -> str:
+def _repair_message(
+    error: str,
+    schema: dict[str, Any],
+    previous_content: Any,
+    *,
+    attempt: int,
+    max_attempts: int,
+) -> str:
     prior = previous_content if isinstance(previous_content, str) else "<no final content>"
     return (
-        "Your previous final answer failed validation. The original input above is unchanged.\n"
+        f"Your previous final answer failed validation (attempt {attempt}/{max_attempts}). "
+        "The original evidence, images, system instructions, and schema above are unchanged.\n"
         f"VALIDATION_ERROR: {error}\n"
-        "Correct only the contract violation. Return one JSON object, with no Markdown. "
+        "Correct only the reported contract violation. Return one JSON object, with no Markdown. "
         "Do not invent evidence or change the causal conclusion merely to pass validation.\n"
+        "EVIDENCE REPAIR RULES: preserve run IDs only when they occur in the supplied "
+        "evidence contract; use planner_intent_evidence only for listed planner/capsule "
+        "event IDs; use runtime_evidence for listed physical/leaf/state event IDs. "
+        "If a run has no valid planner event ID, leave its planner event_ids empty rather "
+        "than copying a physical action event ID into planner_intent_evidence.\n"
         f"OUTPUT_SCHEMA: {json.dumps(schema, ensure_ascii=False)}\n"
         f"PREVIOUS_FINAL_CONTENT: {prior}"
     )
@@ -142,6 +166,18 @@ def _without_local_paths(value: Any) -> Any:
             if key not in {"path", "episode_dir", "optimizer_evidence", "trace", "transcript", "states"}
         }
     return value
+
+
+def _log_event(output: Path, role: str, event: str, **details: Any) -> None:
+    """Append a compact, secret-free optimizer lifecycle event."""
+    value = {
+        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "role": role,
+        "event": event,
+        **_without_local_paths(details),
+    }
+    with (output / "events.jsonl").open("a") as handle:
+        handle.write(json.dumps(value, ensure_ascii=False) + "\n")
 
 
 TModel = TypeVar("TModel", bound=BaseModel)
@@ -161,11 +197,18 @@ def request_structured(
     max_tokens: int = DEFAULT_OPTIMIZER_MAX_TOKENS,
     timeout_s: int = 600,
     images: list[dict[str, Any]] | None = None,
+    max_attempts: int = DEFAULT_OPTIMIZER_MAX_ATTEMPTS,
 ) -> TModel:
-    """Make one role-isolated request plus one same-input schema repair."""
+    """Make one role-isolated request with bounded same-input schema repairs."""
+    if max_attempts < 1:
+        raise ValueError("optimizer max_attempts must be at least one")
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
     sanitized_payload = _without_local_paths(payload)
+    (output / "system_instructions.md").write_text(instructions)
+    (output / "request_payload.json").write_text(
+        json.dumps(sanitized_payload, ensure_ascii=False, indent=2) + "\n"
+    )
     user_content: list[dict[str, Any]] = [
         {"type": "text", "text": json.dumps(sanitized_payload, ensure_ascii=False)}
     ]
@@ -188,9 +231,17 @@ def request_structured(
         "top_k": THINKING_TOP_K,
         "presence_penalty": THINKING_PRESENCE_PENALTY,
         "max_tokens": max_tokens,
+        "max_attempts": max_attempts,
         "image_labels": image_manifest,
         "api_key_stored": False,
         "base64_stored": False,
+        "artifacts": {
+            "system_instructions": "system_instructions.md",
+            "request_payload": "request_payload.json",
+            "image_manifest": "image_manifest.json",
+            "events": "events.jsonl",
+            "raw_response": "raw_response.json",
+        },
     }
     (output / "request_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
     (output / "image_manifest.json").write_text(json.dumps(image_manifest, ensure_ascii=False, indent=2) + "\n")
@@ -201,33 +252,92 @@ def request_structured(
     messages = list(original_messages)
     attempts: list[dict[str, Any]] = []
     last_error = ""
-    for attempt in range(2):
-        response = _post_json(
-            base_url.rstrip("/") + "/chat/completions",
-            api_key,
-            _thinking_request(model=model, messages=messages, max_tokens=max_tokens),
-            timeout_s,
-        )
+    _log_event(
+        output,
+        role,
+        "request_prepared",
+        model=model,
+        max_tokens=max_tokens,
+        image_count=len(image_manifest),
+        payload_top_level_keys=sorted(sanitized_payload),
+    )
+    for attempt in range(max_attempts):
+        _log_event(output, role, "request_started", attempt=attempt + 1, repair=attempt > 0)
+        try:
+            response = _post_json(
+                base_url.rstrip("/") + "/chat/completions",
+                api_key,
+                _thinking_request(model=model, messages=messages, max_tokens=max_tokens),
+                timeout_s,
+            )
+        except OptimizerInfrastructureError as exc:
+            _log_event(
+                output, role, "request_failed", attempt=attempt + 1,
+                error_type=type(exc).__name__, error=str(exc)[:2000],
+            )
+            (output / "raw_response.json").write_text(json.dumps({
+                "attempts": attempts,
+                "infrastructure_error": str(exc)[:2000],
+            }, ensure_ascii=False, indent=2) + "\n")
+            raise
         attempts.append(response)
         content = None
+        choice = (response.get("choices") or [{}])[0]
+        usage = response.get("usage") if isinstance(response.get("usage"), dict) else {}
+        _log_event(
+            output,
+            role,
+            "response_received",
+            attempt=attempt + 1,
+            finish_reason=choice.get("finish_reason"),
+            usage=usage,
+        )
         try:
             content = response["choices"][0]["message"].get("content")
             value = validator(_extract_json(content))
             (output / "raw_response.json").write_text(json.dumps({"attempts": attempts}, ensure_ascii=False, indent=2) + "\n")
+            _log_event(
+                output,
+                role,
+                "response_validated",
+                attempt=attempt + 1,
+                result_type=type(value).__name__,
+                decision=getattr(value, "decision", None),
+            )
             return value
         except (KeyError, IndexError, ValueError, ValidationError) as exc:
             last_error = str(exc)
             finish_reason = (response.get("choices") or [{}])[0].get("finish_reason")
             if finish_reason:
                 last_error += f"; finish_reason={finish_reason}"
-            if attempt == 0:
+            _log_event(
+                output,
+                role,
+                "response_validation_failed",
+                attempt=attempt + 1,
+                error=last_error[:2000],
+                repair_scheduled=attempt + 1 < max_attempts,
+            )
+            if attempt + 1 < max_attempts:
                 messages = original_messages + [
-                    {"role": "user", "content": _repair_message(last_error, schema, content)}
+                    {
+                        "role": "user",
+                        "content": _repair_message(
+                            last_error,
+                            schema,
+                            content,
+                            attempt=attempt + 1,
+                            max_attempts=max_attempts,
+                        ),
+                    }
                 ]
     (output / "raw_response.json").write_text(
         json.dumps({"attempts": attempts, "validation_error": last_error}, ensure_ascii=False, indent=2) + "\n"
     )
-    raise OptimizerProtocolError(f"{role} schema invalid after repair: {last_error}")
+    _log_event(output, role, "protocol_failed", error=last_error[:2000])
+    raise OptimizerProtocolError(
+        f"{role} schema invalid after {max_attempts} attempts: {last_error}"
+    )
 
 
 def _source_files(memory_dir: Path, evidence: list[dict[str, Any]]) -> dict[str, str]:
@@ -358,16 +468,15 @@ def check_optimizer_service(*, base_url: str, api_key: str, model: str, timeout_
             json.loads(response.read())
     except Exception as exc:
         raise OptimizerInfrastructureError(f"optimizer models endpoint failed: {exc}") from exc
-    body = {
-        "model": model,
-        "messages": [{"role": "user", "content": [
+    body = _thinking_request(
+        model=model,
+        messages=[{"role": "user", "content": [
             {"type": "text", "text": "Return one JSON object with status=ready."},
             {"type": "image_url", "image_url": {"url": _red_png_data_url()}},
         ]}],
-        "temperature": 0,
-        "max_tokens": 512,
-        "response_format": {"type": "json_object"},
-    }
+        max_tokens=512,
+    )
+    body["temperature"] = 0
     response = _post_json(base_url.rstrip("/") + "/chat/completions", api_key, body, timeout_s)
     try:
         _extract_json(response["choices"][0]["message"]["content"])

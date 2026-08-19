@@ -187,7 +187,10 @@ def _run_case(
     result_path = run_root / "result.json"
     if result_path.is_file():
         cached = json.loads(result_path.read_text())
-        if cached.get("status") in VALID_STATUSES:
+        if (
+            cached.get("status") in VALID_STATUSES
+            and cached.get("decision_capsule_protocol") == "PlannerDecisionCapsule/v1"
+        ):
             return cached
     last_result: dict[str, Any] | None = None
     existing_attempts = len(list((run_root / "attempts").glob("attempt_[0-9][0-9]")))
@@ -249,6 +252,7 @@ def _run_case(
             "planner_version": args.model,
             "vla_version": args.vla_endpoint,
             "library_role": role,
+            "decision_capsule_protocol": "PlannerDecisionCapsule/v1",
         }, separators=(",", ":"))
         with (attempt_dir / "console.log").open("w") as log:
             try:
@@ -282,6 +286,7 @@ def _run_case(
                 "planner_sampling_seed": planner_sampling_seed,
                 "attempt": attempt,
                 "vla_endpoint": args.vla_endpoint,
+                "decision_capsule_protocol": "PlannerDecisionCapsule/v1",
                 "result_path": str(result_path),
             }
         )
@@ -294,7 +299,10 @@ def _run_case(
         )
         evidence_path = attempt_dir / "optimizer_evidence.json"
         _write_json(evidence_path, evidence)
+        execution_summary_path = attempt_dir / "execution_summary.json"
+        _write_json(execution_summary_path, evidence["execution_summary"])
         last_result["optimizer_evidence"] = str(evidence_path)
+        last_result["execution_summary"] = str(execution_summary_path)
         _write_json(attempt_dir / "result.json", last_result)
         print(f"[skill-evolve] RESULT {case_id}: {last_result['status']}", flush=True)
         if last_result["status"] in VALID_STATUSES:

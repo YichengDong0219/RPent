@@ -208,6 +208,32 @@ def build_optimizer_evidence(
             })
 
     calls = [e for e in events if e.get("event_type") == "tool_call"]
+    capsule_events = [
+        e for e in events if e.get("event_type") == "planner_decision_capsule"
+    ]
+    capsules = [
+        {
+            "capsule_id": event.get("event_id"),
+            "validation_status": event.get("validation_status"),
+            "validation_errors": event.get("validation_errors", []),
+            "authoritative": False,
+            **(
+                event.get("capsule", {})
+                if isinstance(event.get("capsule"), dict) else {}
+            ),
+        }
+        for event in capsule_events
+    ]
+    undeclared_strategy = [
+        {
+            "event_id": event.get("event_id"),
+            "reason": event.get("reason"),
+            "physical_tool": event.get("physical_tool"),
+            "action_ordinal": event.get("action_ordinal"),
+            "capsule_id": event.get("capsule_id"),
+        }
+        for event in events if event.get("event_type") == "undeclared_strategy"
+    ]
     results_by_call = {
         e.get("call_event_id"): e
         for e in events
@@ -289,6 +315,8 @@ def build_optimizer_evidence(
             "result_event_id": result_event.get("event_id"),
             "action_ordinal": call.get("action_ordinal"),
             "active_skill_ids": call.get("active_skill_ids", []),
+            "capsule_id": call.get("capsule_id"),
+            "capsule_validation_status": call.get("capsule_validation_status"),
             "step_before": step_before,
             "step_after": step_after,
             "diagnostics": diagnostics,
@@ -330,7 +358,46 @@ def build_optimizer_evidence(
     context = next((event for event in events if event.get("schema_version") == "EvolutionTraceEvent/v2"), {})
     run_id = str(context.get("run_id") or result.get("case_id") or root.name)
     library_id = next((e.get("library_id") for e in events if e.get("library_id")), None)
-    return {
+    strategy_transitions = [
+        {
+            "capsule_id": capsule.get("capsule_id"),
+            "phase": capsule.get("phase"),
+            "selected_skill_id": capsule.get("selected_skill_id"),
+            "validation_status": capsule.get("validation_status"),
+            "replan_trigger": capsule.get("replan_trigger"),
+        }
+        for capsule in capsules
+    ]
+    instrumentation_turns = sum(
+        1 for event in model_turns
+        if event.get("tool_uses")
+        and all(
+            isinstance(use, dict) and use.get("tool") == "record_strategy_decision"
+            for use in event.get("tool_uses", [])
+        )
+    )
+    execution_summary = {
+        "schema_version": "ExecutionSummary/v1",
+        "leaf_read_order": leaf_ids,
+        "strategy_transitions": strategy_transitions,
+        "primitive_sequence": [
+            {
+                "action_ordinal": action.get("action_ordinal"),
+                "tool": action.get("tool"),
+                "call_event_id": action.get("call_event_id"),
+                "capsule_id": action.get("capsule_id"),
+                "capsule_validation_status": action.get("capsule_validation_status"),
+            }
+            for action in actions
+        ],
+        "undeclared_action_count": len(undeclared_strategy),
+        "authoritative_outcome": {
+            "benchmark_success": benchmark_success,
+            "terminated": any(bool(s.get("libero_terminated")) for s in states),
+            "truncated": any(bool(s.get("libero_truncated")) for s in states),
+        },
+    }
+    evidence_value = {
         "schema_version": "RolloutEvidence/v2",
         "identity": {
             "run_id": run_id,
@@ -344,6 +411,10 @@ def build_optimizer_evidence(
             "library_id": library_id,
             "library": result.get("library", transcript.get("skill_library")),
             "planner_model": context.get("planner_version", transcript.get("model")),
+            "system_prompt_sha256": context.get("system_prompt_sha256"),
+            "decision_capsule_protocol": context.get(
+                "decision_capsule_protocol", result.get("decision_capsule_protocol")
+            ),
             "vla_version": context.get("vla_version"),
             "vla_endpoint": result.get("vla_endpoint"),
             "causal_pairing_eligible": bool(
@@ -372,7 +443,14 @@ def build_optimizer_evidence(
             "leaf_read_before_first_physical": any((x.get("event_id") or 10**9) < first_physical for x in leaf_reads) if first_physical else False,
         },
         "decisions": decisions,
+        "planner_intent": {
+            "schema_version": "PlannerIntentTrace/v1",
+            "capsules": capsules,
+            "undeclared_strategy": undeclared_strategy,
+            "authoritative": False,
+        },
         "actions": actions,
+        "execution_summary": execution_summary,
         "anomalies": {
             "tool_errors": tool_errors,
             "unavailable_tools": unavailable_tools,
@@ -381,10 +459,16 @@ def build_optimizer_evidence(
             "unmatched_transcript_tool_uses": [u for u in transcript_uses if not u["matched"]],
             "physical_action_before_leaf_read": bool(first_physical) and not any((x.get("event_id") or 10**9) < first_physical for x in leaf_reads),
             "turn_budget_exhausted": stop_reason == "turn_budget_exhausted",
+            "undeclared_strategy": undeclared_strategy,
         },
         "visual_evidence": images,
         "cost": {
             "turns": stats.get("turns_used"),
+            "instrumentation_turns": instrumentation_turns,
+            "control_turns": (
+                max(0, int(stats.get("turns_used")) - instrumentation_turns)
+                if isinstance(stats.get("turns_used"), int) else None
+            ),
             "tool_calls": stats.get("tool_calls"),
             "input_tokens": stats.get("total_input_tokens"),
             "output_tokens": stats.get("total_output_tokens"),
@@ -398,6 +482,11 @@ def build_optimizer_evidence(
             "states": str(root / "states.json"),
         },
     }
+    evidence_value["skill_application"] = {
+        "schema_version": "SkillApplicationEvidence/v1",
+        "skills": skill_usage_records(evidence_value),
+    }
+    return evidence_value
 
 
 def aggregate_evidence(evidence: list[dict[str, Any]]) -> dict[str, Any]:
@@ -412,9 +501,27 @@ def skill_usage_records(rollout: dict[str, Any]) -> dict[str, dict[str, Any]]:
 
     first_physical = rollout.get("routing", {}).get("first_physical_event_id")
     leaf_reads = rollout.get("routing", {}).get("leaf_reads", [])
+    capsules = [
+        item for item in rollout.get("planner_intent", {}).get("capsules", [])
+        if isinstance(item, dict)
+    ]
+    capsule_skill_ids = {
+        str(skill_id)
+        for capsule in capsules
+        for skill_id in [
+            capsule.get("selected_skill_id"),
+            *capsule.get("candidate_skill_ids", []),
+            *[
+                rejected.get("skill_id")
+                for rejected in capsule.get("rejected_skills", [])
+                if isinstance(rejected, dict)
+            ],
+        ]
+        if skill_id
+    }
     skill_ids = sorted({
         str(item.get("skill_id")) for item in leaf_reads if item.get("skill_id")
-    })
+    } | capsule_skill_ids)
     actions_by_event = {
         item.get("call_event_id"): item
         for item in rollout.get("actions", [])
@@ -466,13 +573,83 @@ def skill_usage_records(rollout: dict[str, Any]) -> dict[str, dict[str, Any]]:
                         break
                 if first_attributed_action is not None:
                     break
+        selected_capsules = [
+            capsule for capsule in capsules
+            if capsule.get("selected_skill_id") == skill_id
+        ]
+        valid_selected_capsules = [
+            capsule for capsule in selected_capsules
+            if capsule.get("validation_status") == "valid"
+        ]
+        read_before_selection = any(
+            isinstance(read.get("event_id"), int)
+            and isinstance(capsule.get("capsule_id"), int)
+            and read["event_id"] < capsule["capsule_id"]
+            for read in reads
+            for capsule in valid_selected_capsules
+        )
+        rejected_capsules = [
+            {
+                "capsule_id": capsule.get("capsule_id"),
+                "phase": capsule.get("phase"),
+                "reason_code": rejected.get("reason_code"),
+            }
+            for capsule in capsules
+            for rejected in capsule.get("rejected_skills", [])
+            if isinstance(rejected, dict) and rejected.get("skill_id") == skill_id
+        ]
+        valid_capsule_ids = {
+            capsule.get("capsule_id") for capsule in valid_selected_capsules
+        }
+        linked_actions = [
+            {
+                "call_event_id": action.get("call_event_id"),
+                "action_ordinal": action.get("action_ordinal"),
+                "tool": action.get("tool"),
+                "arguments": action.get("arguments", {}),
+                "capsule_id": action.get("capsule_id"),
+            }
+            for action in rollout.get("actions", [])
+            if isinstance(action, dict)
+            and action.get("capsule_id") in valid_capsule_ids
+            and action.get("capsule_validation_status") == "valid"
+        ]
+        capsule_confirmed = bool(
+            read_before_selection and valid_selected_capsules and linked_actions
+        )
+        legacy_confirmed = bool(read_before and visible_reference and first_attributed_action)
+        if capsule_confirmed:
+            application_status = "confirmed_application"
+        elif not reads:
+            application_status = "unavailable_for_application"
+        elif selected_capsules:
+            application_status = "claimed_but_not_followed"
+        elif rejected_capsules:
+            application_status = "explicit_rejection"
+        else:
+            application_status = "consulted_only"
         records[skill_id] = {
             "skill_id": skill_id,
             "read_before_first_physical": read_before,
+            "read_before_selection": read_before_selection,
             "explicitly_referenced": visible_reference,
             "visible_reference": visible_reference,
             "reference_message_indices": sorted(set(reference_messages)),
             "first_attributed_action": first_attributed_action,
-            "used": bool(read_before and visible_reference and first_attributed_action),
+            "selected_capsule_ids": [
+                item.get("capsule_id") for item in selected_capsules
+            ],
+            "valid_selected_capsule_ids": [
+                item.get("capsule_id") for item in valid_selected_capsules
+            ],
+            "rejections": rejected_capsules,
+            "capsule_linked_actions": linked_actions,
+            "application_status": application_status,
+            "attribution_source": (
+                "decision_capsule" if capsule_confirmed
+                else "legacy_visible_text" if legacy_confirmed
+                else "none"
+            ),
+            "used": capsule_confirmed or legacy_confirmed,
         }
     return records

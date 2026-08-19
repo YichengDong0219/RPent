@@ -127,6 +127,8 @@ class Toolkit:
                 run_context=run_context if isinstance(run_context, dict) else {},
             )
         self._register_common_tools()
+        if self._passive_trace is not None:
+            self._register_evolution_tools()
 
     # ------------------------------------------------------------------
     # Registration
@@ -163,6 +165,60 @@ class Toolkit:
             }:
                 handler = self._memory_view_handler(name, handler)
             self.add_tool(name, spec, handler)
+
+    def _register_evolution_tools(self) -> None:
+        """Expose compact intent logging only for versioned evolution runs."""
+        spec = {
+            "name": "record_strategy_decision",
+            "description": (
+                "Record one short, non-authoritative strategy decision for offline skill "
+                "diagnosis. Call before the first physical action and only again when "
+                "replanning, entering recovery, or stopping. This does not control the robot "
+                "or determine task success."
+            ),
+            "input_schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "phase": {"type": "string", "enum": ["initial", "replan", "recovery", "stop"]},
+                    "candidate_skill_ids": {
+                        "type": "array", "maxItems": 8, "uniqueItems": True,
+                        "items": {"type": "string", "maxLength": 128},
+                    },
+                    "selected_skill_id": {"type": ["string", "null"], "maxLength": 128},
+                    "rejected_skills": {
+                        "type": "array", "maxItems": 8,
+                        "items": {
+                            "type": "object", "additionalProperties": False,
+                            "properties": {
+                                "skill_id": {"type": "string", "maxLength": 128},
+                                "reason_code": {
+                                    "type": "string",
+                                    "enum": ["scope_mismatch", "semantic_mismatch", "instruction_conflict", "tool_unavailable", "lower_preference"],
+                                },
+                            },
+                            "required": ["skill_id", "reason_code"],
+                        },
+                    },
+                    "intended_skill_step": {"type": "string", "maxLength": 240},
+                    "action_intent": {"type": "string", "minLength": 1, "maxLength": 240},
+                    "expected_observation": {"type": "string", "maxLength": 240},
+                    "replan_trigger": {"type": ["string", "null"], "maxLength": 240},
+                    "evidence_event_ids": {
+                        "type": "array", "maxItems": 16, "uniqueItems": True,
+                        "items": {"type": "integer", "minimum": 1},
+                    },
+                    "authoritative": {"type": "boolean", "enum": [False]},
+                },
+                "required": ["phase", "candidate_skill_ids", "selected_skill_id", "rejected_skills", "intended_skill_step", "action_intent", "expected_observation", "evidence_event_ids"],
+            },
+        }
+
+        def handler(**kwargs: Any) -> dict[str, Any]:
+            assert self._passive_trace is not None
+            return self._passive_trace.record_decision_capsule(kwargs)
+
+        self.add_tool("record_strategy_decision", spec, handler)
 
     def _memory_alias(self, requested_path: str) -> tuple[Path, str] | None:
         """Map the baseline memory path to the selected rendered snapshot."""
@@ -240,6 +296,12 @@ class Toolkit:
             result = {"error": f"bad arguments for {name}: {e}", "got": input_dict}
         except Exception as e:
             result = {"error": str(e), "traceback": traceback.format_exc()}
+        if (
+            self._passive_trace is not None
+            and call_event_id is not None
+            and isinstance(result, dict)
+        ):
+            result = {**result, "evolution_call_event_id": call_event_id}
         if self._dashboard is not None:
             self._dashboard.on_tool_result(name, result)
         if self._passive_trace is not None:

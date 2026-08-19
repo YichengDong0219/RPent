@@ -8,7 +8,7 @@ set -Eeuo pipefail
 # =============================================================================
 # Quick configuration
 # =============================================================================
-EXPERIMENT_NAME="libero_object_t0_failure_fix_evolution_v1"
+EXPERIMENT_NAME="libero_object_t0_failure_fix_evolution_v4"
 # Base LIBERO checkout. Standard suites use its assets directly. PRO suites
 # use the installed liberopro assets selected by LIBERO_TYPE while retaining
 # this checkout for the shared LIBERO import surface.
@@ -26,6 +26,10 @@ SEED_START=0
 SEED_STOP_EXCLUSIVE=50
 PROPOSAL_SEED_COUNT=5
 REPEATS_PER_SEED=2
+# After all currently available failure/success material groups are archived,
+# sample this many new seeds at a time.  MAX_PROPOSAL_ROLLOUTS is the hard cost
+# bound for one cycle; the stream stops cleanly when it cannot form another
+# eligible group within that bound.
 PROPOSAL_TOPUP_SEED_COUNT=2
 MAX_PROPOSAL_ROLLOUTS=18
 MIN_FAILURE_SUPPORT=2
@@ -33,27 +37,66 @@ MIN_SUCCESS_REFERENCES=1
 FORWARD_SEED_COUNT=2
 FORWARD_REPEATS=2
 RETENTION_CASES=4
-MAX_CANDIDATE_ROUNDS_PER_CLUSTER=2
 DIAGNOSER_MAX_IMAGES=6
 MAX_CYCLES_PER_RUN=1
 MAX_CONSECUTIVE_NO_GAIN=3
 RESET_STALLED=0
 
-# Execution planner (same values as the baseline experiment).
+# Model access
+#
+# Select `local` to retain the existing self-hosted OpenAI-compatible Qwen
+# service, or `apikey` for a cloud/OpenAI-compatible API. Planner and
+# optimizer are independent so the optimizer can be upgraded first without
+# changing robot execution. API keys are intentionally empty by default:
+# export DASHSCOPE_API_KEY='sk-...' before launch, or fill the matching
+# *_API_KEY field temporarily. Do not commit a real key.
+# Current experiment: retain the baseline local execution planner, while using
+# the stronger cloud model only for offline Failure/Fix diagnosis and writing.
+PLANNER_MODEL_SOURCE="apikey"       # local | apikey
+OPTIMIZER_MODEL_SOURCE="apikey"    # local | apikey
+
+# Existing local configuration (the default; preserves prior behavior).
+LOCAL_PLANNER_MODEL="qwen-vl:Qwen3.5-9B"
+LOCAL_QWEN_BASE_URL="http://114.212.227.193:8000/v1"
+LOCAL_QWEN_API_KEY="EMPTY"
+LOCAL_OPTIMIZER_MODEL="Qwen3.5-9B"
+LOCAL_OPTIMIZER_BASE_URL="${LOCAL_QWEN_BASE_URL}"
+LOCAL_OPTIMIZER_API_KEY="${LOCAL_QWEN_API_KEY}"
+
+# API-key configuration. These fields accept any OpenAI-compatible multimodal
+# endpoint. For Alibaba Cloud Model Studio, leave the URL below and set
+# DASHSCOPE_API_KEY in the shell. The planner model is written without the
+# internal `qwen-vl:` prefix; the script adds it when API mode is selected.
+API_PLANNER_MODEL="qwen3.7-plus"
+API_QWEN_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1"
+API_QWEN_API_KEY="${DASHSCOPE_API_KEY:-}"
+API_OPTIMIZER_MODEL="qwen3.7-max-2026-06-08"
+API_OPTIMIZER_BASE_URL="${API_QWEN_BASE_URL}"
+API_OPTIMIZER_API_KEY="${API_QWEN_API_KEY}"
+
+# Resolved values below remain the existing downstream interface. Do not edit
+# them directly; choose a source and set its fields above instead.
 PLANNER="api"
-PLANNER_MODEL="qwen-vl:Qwen3.5-9B"
-QWEN_BASE_URL="http://114.212.227.193:8000/v1"
-QWEN_API_KEY="EMPTY"
+PLANNER_MODEL=""
+QWEN_BASE_URL=""
+QWEN_API_KEY=""
 MAX_TOKENS=24576
 MAX_TURNS=40
 PLANNER_SEED_BASE=100000
 
-# Independent stronger multimodal skill optimizer (OpenAI-compatible API).
-SKILL_OPTIMIZER_BASE_URL="http://114.212.227.193:8000/v1"
-SKILL_OPTIMIZER_API_KEY="EMPTY"
-SKILL_OPTIMIZER_MODEL="Qwen3.5-9B"
-SKILL_OPTIMIZER_MAX_TOKENS=24576
+# Independent multimodal skill optimizer (OpenAI-compatible API).
+SKILL_OPTIMIZER_BASE_URL=""
+SKILL_OPTIMIZER_API_KEY=""
+SKILL_OPTIMIZER_MODEL=""
+# Qwen3.5-27B visual API has an 8k maximum completion; keep the request below
+# that limit. Thinking remains enabled inside the Qwen API request.
+SKILL_OPTIMIZER_MAX_TOKENS=8192
 SKILL_OPTIMIZER_TIMEOUT_S=600
+# Total attempts on one fixed comparison material: the initial answer plus up
+# to two same-evidence validator-guided repairs.  If all three are invalid, or
+# if the resulting candidate fails a replay gate, the stream archives that
+# material and automatically tries the next group before sampling more seeds.
+SKILL_OPTIMIZER_MAX_ATTEMPTS=3
 EVIDENCE_MAX_IMAGES_PER_ROLLOUT=6
 SKILL_DIAGNOSER_PATH="scripts/skill_evolution/skill_diagnoser/SKILL.md"
 SKILL_PATCH_WRITER_PATH="scripts/skill_evolution/skill_patch_writer/SKILL.md"
@@ -79,6 +122,62 @@ RUN_TIMEOUT_S=3600
 MAX_ATTEMPTS=3
 OUTPUT_ROOT="/home/dongyicheng/rpent/logs/skill_evolution"
 # =============================================================================
+
+resolve_model_access() {
+  case "$1" in
+    local)
+      PLANNER_MODEL="${LOCAL_PLANNER_MODEL}"
+      QWEN_BASE_URL="${LOCAL_QWEN_BASE_URL}"
+      QWEN_API_KEY="${LOCAL_QWEN_API_KEY}"
+      ;;
+    apikey)
+      PLANNER_MODEL="${API_PLANNER_MODEL}"
+      QWEN_BASE_URL="${API_QWEN_BASE_URL}"
+      QWEN_API_KEY="${API_QWEN_API_KEY}"
+      if [[ "${PLANNER_MODEL}" != qwen-vl:* ]]; then
+        PLANNER_MODEL="qwen-vl:${PLANNER_MODEL}"
+      fi
+      ;;
+    *)
+      echo "[skill-evolve] ERROR: PLANNER_MODEL_SOURCE must be local or apikey, got '$1'" >&2
+      exit 2
+      ;;
+  esac
+
+  case "$2" in
+    local)
+      SKILL_OPTIMIZER_MODEL="${LOCAL_OPTIMIZER_MODEL}"
+      SKILL_OPTIMIZER_BASE_URL="${LOCAL_OPTIMIZER_BASE_URL}"
+      SKILL_OPTIMIZER_API_KEY="${LOCAL_OPTIMIZER_API_KEY}"
+      ;;
+    apikey)
+      SKILL_OPTIMIZER_MODEL="${API_OPTIMIZER_MODEL}"
+      SKILL_OPTIMIZER_BASE_URL="${API_OPTIMIZER_BASE_URL}"
+      SKILL_OPTIMIZER_API_KEY="${API_OPTIMIZER_API_KEY}"
+      ;;
+    *)
+      echo "[skill-evolve] ERROR: OPTIMIZER_MODEL_SOURCE must be local or apikey, got '$2'" >&2
+      exit 2
+      ;;
+  esac
+
+  if [[ -z "${QWEN_BASE_URL}" || -z "${SKILL_OPTIMIZER_BASE_URL}" ]]; then
+    echo "[skill-evolve] ERROR: selected model endpoint URL is empty" >&2
+    exit 2
+  fi
+  if [[ "${PLANNER_MODEL_SOURCE}" == "apikey" \
+      && ( -z "${QWEN_API_KEY}" || "${QWEN_API_KEY}" == "EMPTY" ) ]]; then
+    echo "[skill-evolve] ERROR: API planner selected but API_QWEN_API_KEY/DASHSCOPE_API_KEY is empty" >&2
+    exit 2
+  fi
+  if [[ "${OPTIMIZER_MODEL_SOURCE}" == "apikey" \
+      && ( -z "${SKILL_OPTIMIZER_API_KEY}" || "${SKILL_OPTIMIZER_API_KEY}" == "EMPTY" ) ]]; then
+    echo "[skill-evolve] ERROR: API optimizer selected but API_OPTIMIZER_API_KEY/DASHSCOPE_API_KEY is empty" >&2
+    exit 2
+  fi
+}
+
+resolve_model_access "${PLANNER_MODEL_SOURCE}" "${OPTIMIZER_MODEL_SOURCE}"
 
 source "${CONDA_ROOT}/etc/profile.d/conda.sh"
 conda activate "${CONDA_ENV}"
@@ -125,6 +224,14 @@ export PYTHONPATH="${LIBERO_CHECKOUT}/libero:${PYTHONPATH:-}"
 export LIBERO_TYPE
 export QWEN_VL_BASE_URL="${QWEN_BASE_URL}"
 export QWEN_VL_API_KEY="${QWEN_API_KEY}"
+# Local vLLM expects chat_template_kwargs; Qwen's API expects the same
+# enable_thinking control at the top level. The optimizer client selects the
+# proper wire format without changing the existing local request path.
+if [[ "${OPTIMIZER_MODEL_SOURCE}" == "apikey" ]]; then
+  export RPENT_OPTIMIZER_REQUEST_MODE="qwen_api"
+else
+  export RPENT_OPTIMIZER_REQUEST_MODE="local_vllm"
+fi
 export HF_HUB_OFFLINE=1
 export NO_PROXY="${NO_PROXY:-127.0.0.1,localhost}"
 export no_proxy="${no_proxy:-127.0.0.1,localhost}"
@@ -230,7 +337,6 @@ for task_index in "${!EVAL_SUITES[@]}"; do
     --forward-seed-count "${FORWARD_SEED_COUNT}" \
     --forward-repeats "${FORWARD_REPEATS}" \
     --retention-cases "${RETENTION_CASES}" \
-    --max-candidate-rounds-per-cluster "${MAX_CANDIDATE_ROUNDS_PER_CLUSTER}" \
     --diagnoser-max-images "${DIAGNOSER_MAX_IMAGES}" \
     --max-cycles-per-run "${MAX_CYCLES_PER_RUN}" \
     --max-consecutive-no-gain "${MAX_CONSECUTIVE_NO_GAIN}" \
@@ -241,6 +347,7 @@ for task_index in "${!EVAL_SUITES[@]}"; do
     --optimizer-model "${SKILL_OPTIMIZER_MODEL}" \
     --optimizer-max-tokens "${SKILL_OPTIMIZER_MAX_TOKENS}" \
     --optimizer-timeout-s "${SKILL_OPTIMIZER_TIMEOUT_S}" \
+    --optimizer-max-attempts "${SKILL_OPTIMIZER_MAX_ATTEMPTS}" \
     --evidence-max-images-per-rollout "${EVIDENCE_MAX_IMAGES_PER_ROLLOUT}" \
     --diagnoser-skill-path "${REPO_ROOT}/${SKILL_DIAGNOSER_PATH}" \
     --patch-writer-skill-path "${REPO_ROOT}/${SKILL_PATCH_WRITER_PATH}" \

@@ -65,11 +65,14 @@ def _first_missing(milestones: dict[str, bool]) -> str:
 def _failure_layer(rollout: dict[str, Any], milestones: dict[str, bool]) -> str:
     anomalies = rollout.get("anomalies", {})
     outcome = rollout.get("outcome", {})
+    actions = rollout.get("actions", [])
     if (
         outcome.get("process_exit_code")
         or outcome.get("agent_error")
-        or anomalies.get("unavailable_tools")
-        or anomalies.get("path_errors")
+        or (
+            anomalies.get("unavailable_tools")
+            and not actions
+        )
     ):
         return "infrastructure"
     usage = skill_usage_records(rollout)
@@ -79,7 +82,6 @@ def _failure_layer(rollout: dict[str, Any], milestones: dict[str, bool]) -> str:
         return "application"
     if outcome.get("planner_finish") and not outcome.get("terminated"):
         return "termination"
-    actions = rollout.get("actions", [])
     if len(actions) > 1 and any(action.get("diagnostics", {}).get("error") for action in actions):
         return "recovery"
     return "execution"
@@ -215,7 +217,9 @@ def build_failure_clusters(
         layer, missing, tool, code = key
         target_ids = Counter()
         for member in members:
-            target_ids.update(skill_usage_records(member))
+            # skill_usage_records maps IDs to attribution dictionaries. Counter
+            # needs the IDs themselves, not those dictionaries as numeric counts.
+            target_ids.update(skill_usage_records(member).keys())
         clusters.append({
             "cluster_id": f"failure_{index:03d}",
             "failure_layer": layer,
@@ -242,7 +246,10 @@ def build_failure_fix_contrasts(
     clusters: dict[str, Any],
     *,
     min_success_references: int = 1,
+    failure_group_size: int = 2,
 ) -> dict[str, Any]:
+    if failure_group_size < 2:
+        raise ValueError("failure_group_size must be at least two")
     by_id = {_run_id(item): item for item in evidence}
     successes = [item for item in evidence if _success(item)]
     contrasts = []
@@ -250,40 +257,56 @@ def build_failure_fix_contrasts(
         if not cluster.get("eligible") or len(successes) < min_success_references:
             continue
         failures = [by_id[run_id] for run_id in cluster["run_ids"] if run_id in by_id]
-        first_failure = failures[0]
-        same_seed = [
-            item for item in successes
-            if item.get("identity", {}).get("seed") == first_failure.get("identity", {}).get("seed")
-        ]
-        comparators = (same_seed + [item for item in successes if item not in same_seed])[:2]
-        divergence = _divergence(first_failure, comparators[0])
-        fix_action = divergence.get("success_action")
-        if fix_action is None:
-            sequence = _tool_sequence(comparators[0])
-            fix_action = sequence[0] if sequence else None
-        if fix_action is None:
-            continue
-        success_usage = skill_usage_records(comparators[0])
-        preferred_skills = [
-            skill_id for skill_id, usage in success_usage.items() if usage.get("used")
-        ]
-        target_candidates = preferred_skills or cluster.get("candidate_skill_ids", [])
-        contrasts.append({
-            "contrast_id": f"contrast_{cluster['cluster_id']}",
-            "cluster_id": cluster["cluster_id"],
-            "relation": "routing_contrast" if cluster["failure_layer"] == "routing" else "preventive_divergence",
-            "failure_run_ids": cluster["run_ids"],
-            "success_reference_ids": [_run_id(item) for item in comparators],
-            "earliest_divergence": divergence,
-            "observed_fix_signature": {
-                "tool": fix_action.get("tool"),
-                "arguments": fix_action.get("arguments", {}),
-                "source_run_id": _run_id(comparators[0]),
-                "source_event_id": fix_action.get("event_id"),
-            },
-            "failure_signature": cluster["failure_signature"],
-            "candidate_skill_ids": target_candidates,
-        })
+        # A material set is deliberately bounded.  Disjoint failure groups let
+        # the stream fall back to genuinely different comparisons instead of
+        # repeatedly sending an ever-growing cluster to the optimizer.
+        complete_groups = len(failures) // failure_group_size
+        for group_index in range(complete_groups):
+            group = failures[
+                group_index * failure_group_size:(group_index + 1) * failure_group_size
+            ]
+            first_failure = group[0]
+            same_seed = [
+                item for item in successes
+                if item.get("identity", {}).get("seed")
+                == first_failure.get("identity", {}).get("seed")
+            ]
+            comparators = (
+                same_seed + [item for item in successes if item not in same_seed]
+            )[:2]
+            divergence = _divergence(first_failure, comparators[0])
+            fix_action = divergence.get("success_action")
+            if fix_action is None:
+                sequence = _tool_sequence(comparators[0])
+                fix_action = sequence[0] if sequence else None
+            if fix_action is None:
+                continue
+            success_usage = skill_usage_records(comparators[0])
+            preferred_skills = [
+                skill_id for skill_id, usage in success_usage.items() if usage.get("used")
+            ]
+            target_candidates = preferred_skills or cluster.get("candidate_skill_ids", [])
+            contrasts.append({
+                "contrast_id": f"contrast_{cluster['cluster_id']}_{group_index:02d}",
+                "cluster_id": cluster["cluster_id"],
+                "material_group_index": group_index,
+                "relation": (
+                    "routing_contrast"
+                    if cluster["failure_layer"] == "routing"
+                    else "preventive_divergence"
+                ),
+                "failure_run_ids": [_run_id(item) for item in group],
+                "success_reference_ids": [_run_id(item) for item in comparators],
+                "earliest_divergence": divergence,
+                "observed_fix_signature": {
+                    "tool": fix_action.get("tool"),
+                    "arguments": fix_action.get("arguments", {}),
+                    "source_run_id": _run_id(comparators[0]),
+                    "source_event_id": fix_action.get("event_id"),
+                },
+                "failure_signature": cluster["failure_signature"],
+                "candidate_skill_ids": target_candidates,
+            })
     return {"schema_version": "FailureFixContrastBatch/v1", "contrasts": contrasts}
 
 
@@ -296,7 +319,10 @@ def build_batch_artifacts(
     health = build_healthy_reference(evidence)
     clusters = build_failure_clusters(evidence, min_failure_support=min_failure_support)
     contrasts = build_failure_fix_contrasts(
-        evidence, clusters, min_success_references=min_success_references
+        evidence,
+        clusters,
+        min_success_references=min_success_references,
+        failure_group_size=min_failure_support,
     )
     return {
         "schema_version": "FailureFixBatchArtifacts/v1",
