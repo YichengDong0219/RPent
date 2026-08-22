@@ -147,6 +147,14 @@ def _build_argparser() -> argparse.ArgumentParser:
         default=None,
         help="Passive JSONL trace path (only used with --skill-library).",
     )
+    ap.add_argument(
+        "--memory-snapshot",
+        default=None,
+        help=(
+            "Immutable baseline-compatible memory snapshot used without "
+            "enabling evolution prompts or traces."
+        ),
+    )
 
     return ap
 
@@ -286,9 +294,14 @@ def main() -> int:
         video_path=str(Path(output_dir) / "episode.mp4"),
         dashboard=dashboard_state,
         skill_library=args.skill_library,
+        memory_snapshot=args.memory_snapshot,
         evolution_trace_path=(
-            args.evolution_trace
-            or str(Path(output_dir) / "evolution_trace.jsonl")
+            (
+                args.evolution_trace
+                or str(Path(output_dir) / "evolution_trace.jsonl")
+            )
+            if args.skill_library
+            else None
         ),
     )
 
@@ -346,6 +359,7 @@ def main() -> int:
         "finish": finish_result,
         "agent_error": agent_error,
         "skill_library": args.skill_library,
+        "memory_snapshot": args.memory_snapshot,
         "stats": stats,
         "messages": _serialize_messages(messages),
     }

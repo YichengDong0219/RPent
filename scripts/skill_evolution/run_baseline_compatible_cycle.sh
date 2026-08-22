@@ -8,7 +8,7 @@ set -Eeuo pipefail
 # =============================================================================
 # Quick configuration
 # =============================================================================
-EXPERIMENT_NAME="libero_object_t0_failure_fix_evolution_v4"
+EXPERIMENT_NAME="libero_object_t0_failure_fix_evolution_821"
 # Base LIBERO checkout. Standard suites use its assets directly. PRO suites
 # use the installed liberopro assets selected by LIBERO_TYPE while retaining
 # this checkout for the shared LIBERO import surface.
@@ -52,7 +52,7 @@ RESET_STALLED=0
 # *_API_KEY field temporarily. Do not commit a real key.
 # Current experiment: retain the baseline local execution planner, while using
 # the stronger cloud model only for offline Failure/Fix diagnosis and writing.
-PLANNER_MODEL_SOURCE="apikey"       # local | apikey
+PLANNER_MODEL_SOURCE="local"       # local | apikey
 OPTIMIZER_MODEL_SOURCE="apikey"    # local | apikey
 
 # Existing local configuration (the default; preserves prior behavior).
@@ -69,7 +69,7 @@ LOCAL_OPTIMIZER_API_KEY="${LOCAL_QWEN_API_KEY}"
 # internal `qwen-vl:` prefix; the script adds it when API mode is selected.
 API_PLANNER_MODEL="qwen3.7-plus"
 API_QWEN_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1"
-API_QWEN_API_KEY="${DASHSCOPE_API_KEY:-}"
+API_QWEN_API_KEY="${DASHSCOPE_API_KEY:-sk-ws-H.EPPIPMH.iMZ7.MEUCIQCooBgRcc6GUoQGXz2iMzy-V6RdN03KBlZd45RmxH_D4AIgReuhfg1k5cnaFKP6UTHk682fZTqrypJa2wwYKRDrEYc}"
 API_OPTIMIZER_MODEL="qwen3.7-max-2026-06-08"
 API_OPTIMIZER_BASE_URL="${API_QWEN_BASE_URL}"
 API_OPTIMIZER_API_KEY="${API_QWEN_API_KEY}"

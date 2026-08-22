@@ -46,6 +46,7 @@ def get_toolkit(
     video_path: str | None = None,
     dashboard: Any = None,
     skill_library: str | None = None,
+    memory_snapshot: str | None = None,
     evolution_trace_path: str | None = None,
 ):
     """Return the LIBERO toolkit (common tools + LIBERO primitives)."""
@@ -56,6 +57,7 @@ def get_toolkit(
         video_path=video_path,
         dashboard=dashboard,
         skill_library=skill_library,
+        memory_snapshot=memory_snapshot,
         evolution_trace_path=evolution_trace_path,
     )
 
@@ -96,6 +98,11 @@ def _add_cli_args(parser: argparse.ArgumentParser, use_dashboard: bool) -> None:
                              "If unset, a local vla_server is spawned.")
     parser.add_argument("--cuda-device", default=None,
                         help="GPU device(s) to expose via CUDA_VISIBLE_DEVICES.")
+    parser.add_argument(
+        "--trajectory-output",
+        default=None,
+        help="Optional raw HDF5 path for exact pre-observation/action recording.",
+    )
 
 
 def _parse_config(args: argparse.Namespace) -> RunConfig:
@@ -111,6 +118,10 @@ def _parse_config(args: argparse.Namespace) -> RunConfig:
         raise ValueError("--task is required")
     if args.hires_retention_steps < 0:
         raise ValueError("--hires-retention-steps must be >= 0")
+    if args.trajectory_output and args.env_endpoint:
+        raise ValueError(
+            "--trajectory-output requires a locally spawned env_server"
+        )
 
     recipe_tag = f"{args.suite.replace('libero_', '')}_t{args.task}_s{args.seed}"
     prompt_vars = {
@@ -215,6 +226,11 @@ def _init_runtime(
                 "--transport", "http",
                 "--host", host,
                 "--port", str(port),
+                *(
+                    ["--trajectory-output", str(args.trajectory_output)]
+                    if args.trajectory_output
+                    else []
+                ),
             ],
             env=_subprocess_env(
                 args.cuda_device,

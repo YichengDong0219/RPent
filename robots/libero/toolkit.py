@@ -30,11 +30,13 @@ class LiberoToolkit(Toolkit):
         video_path: str | None = None,
         dashboard: Any = None,
         skill_library: str | None = None,
+        memory_snapshot: str | None = None,
         evolution_trace_path: str | None = None,
     ) -> None:
         super().__init__(
             dashboard=dashboard,
             skill_library=skill_library,
+            memory_snapshot=memory_snapshot,
             evolution_trace_path=evolution_trace_path,
         )
         self._next_step: int = 0
@@ -148,15 +150,24 @@ class LiberoToolkit(Toolkit):
     def close(self) -> None:
         """Flush the agent-side video buffer to disk (end-of-run).
         """
-        if self._video_path is None:
-            return
+        if self._video_path is not None:
+            try:
+                self._primitives.stop_recording_and_save(self._video_path)
+            except Exception as e:
+                # The runner is in the cleanup path; never let a video save
+                # abort it.
+                get_logger("libero_toolkit").warning(
+                    f"failed to save video to {self._video_path}: {e}"
+                )
         try:
-            self._primitives.stop_recording_and_save(self._video_path)
+            result = self._primitives.env.finalize_trajectory()
+            if result is not None:
+                get_logger("libero_toolkit").info(
+                    "trajectory finalized: %s", result
+                )
         except Exception as e:
-            # The runner is in the cleanup path; never let a video save
-            # abort it.
             get_logger("libero_toolkit").warning(
-                f"failed to save video to {self._video_path}: {e}"
+                f"failed to finalize trajectory: {e}"
             )
 
     def write_recipe(self, recipe_tag: str) -> str:

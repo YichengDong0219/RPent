@@ -137,3 +137,9 @@ class LiberoEnvClient:
         return self._client.call(
             "env.cached_image", timeout_s=_TIMEOUT_S["default"]
         )
+
+    def finalize_trajectory(self) -> dict | None:
+        """Flush the optional env-server trajectory recorder."""
+        return self._client.call(
+            "env.finalize_trajectory", timeout_s=_TIMEOUT_S["default"]
+        )

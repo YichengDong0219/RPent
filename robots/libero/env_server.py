@@ -10,6 +10,7 @@ from typing import Any
 os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
 
+from rpent.distillation.trajectory import LiberoTrajectoryRecorder
 from rpent.utils.config import (
     get_repo_root,
     get_rlinf_repo_path,
@@ -28,9 +29,7 @@ os.environ.setdefault("ROBOT_PLATFORM", "LIBERO")
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
 from omegaconf import OmegaConf  # noqa: E402
-
 from rlinf.envs.libero.libero_env import LiberoEnv  # noqa: E402
-
 
 # ---------------------------------------------------------------------------
 # Config builders
@@ -128,7 +127,13 @@ class LiberoEnvFacade(RpcFacade):
     trip.
     """
 
-    def __init__(self, env: LiberoEnv, *, meta: dict):
+    def __init__(
+        self,
+        env: LiberoEnv,
+        *,
+        meta: dict,
+        trajectory_output: str | None = None,
+    ):
         super().__init__()
         self._env = env
         self._env_idx = 0
@@ -137,6 +142,11 @@ class LiberoEnvFacade(RpcFacade):
         # client compares against its own expected values at construction
         # and refuses to talk to a stale or mis-configured server.
         self._meta = dict(meta)
+        self._trajectory_output = trajectory_output
+        self._trajectory: LiberoTrajectoryRecorder | None = None
+        self._trajectory_obs: dict | None = None
+        self._terminated = False
+        self._truncated = False
 
     def _dispatch(self, method: str, args: tuple, kwargs: dict) -> Any:
         if method.startswith("env."):
@@ -186,15 +196,31 @@ class LiberoEnvFacade(RpcFacade):
         obs, info = self._env.reset()
         obs = self._strip_obs(_to_numpy_tree(obs))
         self._done = False
+        self._terminated = False
+        self._truncated = False
+        if self._trajectory is not None:
+            self._trajectory.close()
+        self._trajectory = None
+        if self._trajectory_output:
+            self._trajectory = LiberoTrajectoryRecorder(
+                self._trajectory_output,
+                task=str(obs["task_descriptions"]),
+            )
+        self._trajectory_obs = obs
         return obs, _to_numpy_tree(info)
 
     def step(self, action):
         assert not self._done, "step called after episode done"
+        if self._trajectory is not None:
+            self._trajectory.append(self._trajectory_obs, action)
         obs, rew, term, trunc, info = self._env.step(self._expand_action(action))
         obs = self._strip_obs(_to_numpy_tree(obs))
         term = self._strip(_to_numpy_tree(term))
         trunc = self._strip(_to_numpy_tree(trunc))
         self._record_done(term, trunc)
+        self._terminated = self._terminated or bool(np.asarray(term).any())
+        self._truncated = self._truncated or bool(np.asarray(trunc).any())
+        self._trajectory_obs = obs
         return (
             obs,
             self._strip(_to_numpy_tree(rew)),
@@ -222,7 +248,22 @@ class LiberoEnvFacade(RpcFacade):
         obs_list = [self._strip_obs(_to_numpy_tree(o)) for o in obs_list]
         term = self._strip(_to_numpy_tree(term))
         trunc = self._strip(_to_numpy_tree(trunc))
+        if self._trajectory is not None:
+            action_array = np.asarray(actions)
+            first_done = len(action_array) - 1
+            done_indices = np.flatnonzero(
+                np.asarray(term, dtype=bool) | np.asarray(trunc, dtype=bool)
+            )
+            if done_indices.size:
+                first_done = int(done_indices[0])
+            pre_obs = self._trajectory_obs
+            for index in range(first_done + 1):
+                self._trajectory.append(pre_obs, action_array[index])
+                pre_obs = obs_list[index]
         self._record_done(term, trunc)
+        self._terminated = self._terminated or bool(np.asarray(term).any())
+        self._truncated = self._truncated or bool(np.asarray(trunc).any())
+        self._trajectory_obs = obs_list[-1]
         obs_field = obs_list if return_all_frames else obs_list[-1]
         return (
             obs_field,
@@ -276,6 +317,16 @@ class LiberoEnvFacade(RpcFacade):
             return None
         return cached.cpu().numpy() if hasattr(cached, "cpu") else np.asarray(cached)
 
+    def finalize_trajectory(self) -> dict | None:
+        if self._trajectory is None:
+            return None
+        result = self._trajectory.finalize(
+            terminated=self._terminated,
+            truncated=self._truncated,
+        )
+        self._trajectory = None
+        return result
+
 
 # ---------------------------------------------------------------------------
 # Main
@@ -291,6 +342,7 @@ def main():
     p.add_argument("--task", type=int, default=9)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--max-episode-steps", type=int, default=600)
+    p.add_argument("--trajectory-output", type=str, default=None)
     args = p.parse_args()
 
     raw_env = make_env(args.task, args.seed, suite_name=args.suite,
@@ -303,6 +355,7 @@ def main():
             "seed": args.seed,
             "max_episode_steps": args.max_episode_steps,
         },
+        trajectory_output=args.trajectory_output,
     )
     facade.serve(transport=args.transport, host=args.host, port=args.port)
 

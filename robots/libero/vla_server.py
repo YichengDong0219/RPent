@@ -32,7 +32,6 @@ import numpy as np  # noqa: E402
 import torch  # noqa: E402
 from omegaconf import OmegaConf  # noqa: E402
 
-
 # ---------------------------------------------------------------------------
 # Config builders
 # ---------------------------------------------------------------------------
@@ -128,6 +127,9 @@ class VLAFacade(RpcFacade):
 
     def __init__(self, model_path: str):
         super().__init__()
+        from rpent.distillation.openpi_compat import apply_openpi_mean_std_compat
+
+        apply_openpi_mean_std_compat()
         from rlinf.models.embodiment.openpi import get_model as get_openpi_model
 
         cfg = build_model_cfg(model_path=model_path)

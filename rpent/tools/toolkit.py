@@ -101,6 +101,7 @@ class Toolkit:
         *,
         dashboard: Any = None,
         skill_library: str | None = None,
+        memory_snapshot: str | None = None,
         evolution_trace_path: str | None = None,
     ) -> None:
         # name -> (spec, handler)
@@ -126,6 +127,12 @@ class Toolkit:
                 library_id=str(manifest["library_id"]),
                 run_context=run_context if isinstance(run_context, dict) else {},
             )
+        elif memory_snapshot is not None:
+            from rpent.evolution.library import load_manifest, rendered_memory_dir
+
+            self._skill_library = Path(memory_snapshot).resolve()
+            load_manifest(self._skill_library)
+            self._rendered_memory = rendered_memory_dir(self._skill_library)
         self._register_common_tools()
         if self._passive_trace is not None:
             self._register_evolution_tools()
@@ -264,8 +271,11 @@ class Toolkit:
             if isinstance(result, dict) and "path" in result:
                 result = dict(result)
                 result["path"] = str(common._resolve(requested_path))
-            if name == "read_text_file" and "error" not in result:
-                assert self._passive_trace is not None
+            if (
+                name == "read_text_file"
+                and "error" not in result
+                and self._passive_trace is not None
+            ):
                 self._passive_trace.activate_memory(relative)
             return result
 
