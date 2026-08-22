@@ -13,7 +13,7 @@ PHYSICAL_TOOLS = {
 DIAGNOSTIC_KEYS = {
     "error", "success", "task_success", "contact_skill_executed",
     "chunks_used", "max_chunks", "peak_lift_m", "post_min_ascent_m",
-    "min_gripper_opening", "final_dist_m", "steps_used",
+    "min_gripper_opening", "final_dist_m", "steps_used", "max_steps",
     "libero_terminated", "libero_truncated", "agent_elapsed_s", "elapsed_s",
 }
 IMAGE_KEYS = {

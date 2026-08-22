@@ -12,6 +12,7 @@ import asyncio
 import base64
 import dataclasses
 import json
+import os
 import queue
 from pathlib import Path
 from typing import Any
@@ -315,6 +316,14 @@ def _build_model_settings(model: Model, max_tokens: int) -> ModelSettings:
             anthropic_cache_tool_definitions=True,
             anthropic_cache_messages=True,
         )
+    if os.environ.get("QWEN_VL_ENABLE_THINKING") == "1":
+        from pydantic_ai.models.openai import OpenAIChatModel, OpenAIChatModelSettings
+
+        if isinstance(model, OpenAIChatModel) and model.model_name.lower().startswith("qwen"):
+            return OpenAIChatModelSettings(
+                max_tokens=max_tokens,
+                extra_body={"enable_thinking": True},
+            )
     return ModelSettings(max_tokens=max_tokens)
 
 

@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""Run one baseline-compatible skill evolution cycle.
-
-This controller changes one variable between paired rollouts: the rendered
-skill-library directory. Planner prompt, tool schemas, VLA endpoint, and RPent
-arguments are shared by parent and candidate.
-"""
+"""Run one episode-boundary failure-to-recovery skill evolution cycle."""
 
 from __future__ import annotations
 
@@ -17,7 +12,6 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from rpent.evolution.admission import decide_admission
 from rpent.evolution.evidence import aggregate_evidence, build_optimizer_evidence
 from rpent.evolution.library import apply_patch, create_snapshot, rendered_memory_dir
 from rpent.evolution.library import load_manifest
@@ -25,8 +19,12 @@ from rpent.evolution.optimizer import (
     InvalidPatchError,
     OptimizerInfrastructureError,
     OptimizerProtocolError,
-    optimize_skills,
 )
+from rpent.evolution.recovery import (
+    build_recovery_trace, load_recovery_trace, select_recovery_material,
+    source_metrics,
+)
+from rpent.evolution.recovery_optimizer import optimize_recovery
 from rpent.evolution.rollout import summarize_rollout
 
 VALID_STATUSES = {"success", "benchmark_failure"}
@@ -34,16 +32,6 @@ VALID_STATUSES = {"success", "benchmark_failure"}
 
 def _csv_ints(value: str) -> list[int]:
     return [int(item.strip()) for item in value.split(",") if item.strip()]
-
-
-def _preservation_cases(value: str) -> list[tuple[str, int, int]]:
-    cases = []
-    for item in value.split(";"):
-        if not item.strip():
-            continue
-        suite, task, seed = item.strip().split(":")
-        cases.append((suite, int(task), int(seed)))
-    return cases
 
 
 def _write_json(path: Path, value: Any) -> None:
@@ -119,6 +107,7 @@ def _prepare_libero(args: argparse.Namespace) -> Path:
             "LIBERO_TYPE": args.libero_type,
             "QWEN_VL_BASE_URL": args.qwen_base_url,
             "QWEN_VL_API_KEY": args.qwen_api_key,
+            "QWEN_VL_ENABLE_THINKING": "1" if args.planner_enable_thinking else "0",
             "HF_HUB_OFFLINE": "1",
         }
     )
@@ -177,9 +166,10 @@ def _run_case(
     suite: str,
     task: int,
     seed: int,
+    repeat: int,
     cycle_name: str,
 ) -> dict[str, Any]:
-    case_id = f"{suite}__t{task:03d}__s{seed:06d}"
+    case_id = f"{suite}__t{task:03d}__s{seed:06d}__r{repeat:02d}"
     run_root = args.experiment_dir / "rollouts" / cycle_name / phase / role / case_id
     result_path = run_root / "result.json"
     if result_path.is_file():
@@ -256,8 +246,10 @@ def _run_case(
                 "suite": suite,
                 "task": task,
                 "seed": seed,
+                "repeat": repeat,
                 "attempt": attempt,
                 "vla_endpoint": args.vla_endpoint,
+                "planner_model_source": args.planner_model_source,
             }
         )
         _write_json(attempt_dir / "result.json", last_result)
@@ -269,7 +261,10 @@ def _run_case(
         )
         evidence_path = attempt_dir / "optimizer_evidence.json"
         _write_json(evidence_path, evidence)
+        recovery_trace_path = attempt_dir / "failure_recovery_trace.jsonl"
+        build_recovery_trace(evidence, recovery_trace_path)
         last_result["optimizer_evidence"] = str(evidence_path)
+        last_result["failure_recovery_trace"] = str(recovery_trace_path)
         _write_json(attempt_dir / "result.json", last_result)
         print(f"[skill-evolve] RESULT {case_id}: {last_result['status']}", flush=True)
         if last_result["status"] in VALID_STATUSES:
@@ -318,6 +313,55 @@ def _evidence_for(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return values
 
 
+def _traces_for(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    values = []
+    for result in results:
+        path = result.get("failure_recovery_trace")
+        if path and Path(path).is_file():
+            values.append(load_recovery_trace(path))
+    return values
+
+
+def _aggregate_source(traces: list[dict[str, Any]], target: str) -> dict[str, Any]:
+    rows = [source_metrics(trace, target) for trace in traces]
+    return {
+        "runs": rows,
+        "successes": sum(int(row["success"]) for row in rows),
+        "failure_anchors": sum(int(row["failure_anchors"]) for row in rows),
+        "recovery_actions": sum(int(row["recovery_actions"]) for row in rows),
+        "turns": sum(int(row["turns"]) for row in rows),
+        "target_activations": sum(int(row["target_active"]) for row in rows),
+    }
+
+
+def _source_admission(parent: list[dict[str, Any]], candidate: list[dict[str, Any]], target: str) -> dict[str, Any]:
+    p = _aggregate_source(parent, target)
+    c = _aggregate_source(candidate, target)
+    regressions = [
+        index for index, (left, right) in enumerate(zip(p["runs"], c["runs"]))
+        if left["success"] and not right["success"]
+    ]
+    if regressions:
+        accepted, reason = False, "source_success_regression"
+    elif c["target_activations"] == 0:
+        accepted, reason = False, "candidate_never_read_target_skill"
+    elif c["successes"] > p["successes"]:
+        accepted, reason = True, "more_source_successes"
+    elif c["successes"] < p["successes"]:
+        accepted, reason = False, "fewer_source_successes"
+    else:
+        p_cost = (p["failure_anchors"], p["recovery_actions"], p["turns"])
+        c_cost = (c["failure_anchors"], c["recovery_actions"], c["turns"])
+        accepted = c_cost < p_cost
+        reason = "equal_success_lower_recovery_cost" if accepted else "no_strict_source_improvement"
+    return {
+        "schema_version": "SourceReplayAdmission/v1",
+        "decision": "accepted" if accepted else "rejected", "reason": reason,
+        "source_success_regression_indices": regressions,
+        "parent": p, "candidate": c,
+    }
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo-root", type=Path, required=True)
@@ -327,36 +371,37 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--suite", required=True)
     parser.add_argument("--task", type=int, required=True)
     parser.add_argument("--discovery-seeds", default="0,1,2")
-    parser.add_argument("--correction-seeds", default="3,4,5")
-    parser.add_argument(
-        "--preservation-cases",
-        required=True,
-        help="Semicolon-separated SUITE:TASK:SEED cases known to succeed in baseline",
-    )
+    parser.add_argument("--discovery-repeats", type=int, default=2)
+    parser.add_argument("--source-replay-repeats", type=int, default=2)
+    parser.add_argument("--minimum-similarity", type=float, default=0.65)
     parser.add_argument("--planner", default="api")
+    parser.add_argument("--planner-model-source", choices=("local", "remote"), default="local")
     parser.add_argument("--model", required=True)
     parser.add_argument("--qwen-base-url", required=True)
-    parser.add_argument("--qwen-api-key", default="EMPTY")
+    parser.add_argument(
+        "--qwen-api-key", default=os.environ.get("RPENT_PLANNER_API_KEY", "EMPTY")
+    )
+    parser.add_argument("--planner-enable-thinking", action="store_true")
     parser.add_argument("--vla-endpoint", required=True)
     parser.add_argument("--libero-type", default="pro")
     parser.add_argument("--cuda-device", default="0")
     parser.add_argument("--max-tokens", type=int, default=4096)
     parser.add_argument("--optimizer-base-url", required=True)
-    parser.add_argument("--optimizer-api-key", default="EMPTY")
+    parser.add_argument(
+        "--optimizer-api-key", default=os.environ.get("RPENT_OPTIMIZER_API_KEY", "EMPTY")
+    )
+    parser.add_argument("--optimizer-model-source", choices=("local", "remote"), default="local")
+    parser.add_argument("--optimizer-enable-thinking", action="store_true")
     parser.add_argument("--optimizer-model", required=True)
     parser.add_argument("--optimizer-max-tokens", type=int, default=8192)
     parser.add_argument("--optimizer-timeout-s", type=int, default=600)
     parser.add_argument("--optimizer-max-images-per-rollout", type=int, default=6)
     parser.add_argument("--optimizer-skill-path", type=Path, required=True)
-    parser.add_argument("--max-patch-lines", type=int, default=24)
-    parser.add_argument("--max-patch-new-chars", type=int, default=2000)
-    parser.add_argument("--max-patch-growth-chars", type=int, default=1000)
     parser.add_argument("--max-turns", type=int, default=40)
     parser.add_argument("--max-episode-steps", type=int, default=10000)
     parser.add_argument("--hires-retention-steps", type=int, default=5)
     parser.add_argument("--run-timeout-s", type=int, default=3600)
     parser.add_argument("--max-attempts", type=int, default=2)
-    parser.add_argument("--minimum-activations", type=int, default=2)
     parser.add_argument("--extra-rpent-arg", action="append", default=[])
     parser.add_argument("--python", default=sys.executable)
     return parser
@@ -367,6 +412,16 @@ def main() -> int:
     args.repo_root = args.repo_root.resolve()
     args.libero_root = args.libero_root.resolve()
     args.experiment_dir = args.experiment_dir.resolve()
+    if args.planner_model_source == "remote":
+        if not args.qwen_base_url.startswith("https://") or args.qwen_api_key in {"", "EMPTY"}:
+            raise ValueError("remote planner requires an HTTPS base URL and RPENT_PLANNER_API_KEY")
+        if "qwen3.7-max" in args.model.lower() and not args.planner_enable_thinking:
+            raise ValueError("remote Qwen3.7-Max planner requires --planner-enable-thinking")
+    if args.optimizer_model_source == "remote":
+        if not args.optimizer_base_url.startswith("https://") or args.optimizer_api_key in {"", "EMPTY"}:
+            raise ValueError("remote optimizer requires an HTTPS base URL and RPENT_OPTIMIZER_API_KEY")
+        if "qwen3.7-max" in args.optimizer_model.lower() and not args.optimizer_enable_thinking:
+            raise ValueError("remote Qwen3.7-Max optimizer requires --optimizer-enable-thinking")
     args.experiment_dir.mkdir(parents=True, exist_ok=True)
     runtime_libero_root = _prepare_libero(args)
     libraries = args.experiment_dir / "libraries"
@@ -396,8 +451,6 @@ def main() -> int:
             "experiment_dir": str(args.experiment_dir),
             "memory_dir": str(args.memory_dir.resolve()),
             "discovery_seeds": _csv_ints(args.discovery_seeds),
-            "correction_seeds": _csv_ints(args.correction_seeds),
-            "preservation_cases": _preservation_cases(args.preservation_cases),
         }
     )
     resolved["qwen_api_key"] = "<redacted>"
@@ -406,20 +459,26 @@ def main() -> int:
     resolved["cycle"] = cycle_name
     _write_json(cycle_dir / "resolved_config.json", resolved)
 
-    discovery = [
-        _run_case(
-            args,
-            phase="discovery",
-            role="parent",
-            library=parent,
-            suite=args.suite,
-            task=args.task,
-            seed=seed,
-            cycle_name=cycle_name,
-        )
-        for seed in _csv_ints(args.discovery_seeds)
-    ]
-    valid_discovery = [item for item in discovery if item["status"] in VALID_STATUSES]
+    discovery: list[dict[str, Any]] = []
+    material = None
+    for seed in _csv_ints(args.discovery_seeds):
+        for repeat in range(args.discovery_repeats):
+            discovery.append(_run_case(
+                args, phase="proposal", role="parent", library=parent,
+                suite=args.suite, task=args.task, seed=seed, repeat=repeat,
+                cycle_name=cycle_name,
+            ))
+            material = select_recovery_material(
+                _traces_for(discovery), minimum_similarity=args.minimum_similarity,
+            )
+            if material is not None:
+                print(
+                    f"[skill-evolve] episode-boundary material ready: {material['kind']} "
+                    f"target={material['target_skill_id']}", flush=True,
+                )
+                break
+        if material is not None:
+            break
     discovery_evidence = _evidence_for(discovery)
     if discovery_evidence:
         batch = aggregate_evidence(discovery_evidence)
@@ -432,12 +491,12 @@ def main() -> int:
                 for image in item.get("visual_evidence", [])
             ],
         )
-    if len(valid_discovery) < 2:
+    if material is None:
         value = {
             "status": "no_patch",
             "decision": "no_patch",
             "problem_type": "insufficient_evidence",
-            "reason": "fewer than two valid discovery rollouts",
+            "reason": "no grounded self-recovery or similar failure/success pair",
             "parent_library": str(parent),
         }
         _write_json(cycle_dir / "cycle_result.json", value)
@@ -445,8 +504,9 @@ def main() -> int:
         return 0
 
     try:
-        decision = optimize_skills(
-            evidence=discovery_evidence,
+        _write_json(optimizer_dir / "recovery_material.json", material)
+        decision, patch = optimize_recovery(
+            material=material,
             memory_dir=rendered_memory_dir(parent),
             skill_path=args.optimizer_skill_path,
             base_url=args.optimizer_base_url,
@@ -455,9 +515,8 @@ def main() -> int:
             output_dir=optimizer_dir,
             max_tokens=args.optimizer_max_tokens,
             timeout_s=args.optimizer_timeout_s,
-            max_patch_lines=args.max_patch_lines,
-            max_patch_new_chars=args.max_patch_new_chars,
-            max_patch_growth_chars=args.max_patch_growth_chars,
+            enable_thinking=args.optimizer_enable_thinking,
+            model_source=args.optimizer_model_source,
         )
     except OptimizerInfrastructureError as exc:
         value = {
@@ -496,57 +555,47 @@ def main() -> int:
         value = {
             "status": "no_patch",
             "decision": "no_patch",
-            "problem_type": decision.problem_type,
             "causal_summary": decision.causal_summary,
             "parent_library": str(parent),
         }
         _write_json(cycle_dir / "cycle_result.json", value)
         print(json.dumps(value, ensure_ascii=False, indent=2))
         return 0
-    assert decision.patch is not None
-    patch = decision.patch
+    assert patch is not None
     patch_path = cycle_dir / "candidate.patch.json"
     _write_json(patch_path, patch.model_dump(mode="json"))
     candidate = cycle_dir / "candidate_library"
     apply_patch(parent, patch, candidate, library_id=f"{next_library_id}-candidate")
 
-    correction_parent = []
-    correction_candidate = []
-    for seed in _csv_ints(args.correction_seeds):
-        correction_parent.append(
-            _run_case(args, phase="correction", role="parent", library=parent, suite=args.suite, task=args.task, seed=seed, cycle_name=cycle_name)
-        )
-        correction_candidate.append(
-            _run_case(args, phase="correction", role="candidate", library=candidate, suite=args.suite, task=args.task, seed=seed, cycle_name=cycle_name)
-        )
-
-    preservation_parent = []
-    preservation_candidate = []
-    for suite, task, seed in _preservation_cases(args.preservation_cases):
-        preservation_parent.append(
-            _run_case(args, phase="preservation", role="parent", library=parent, suite=suite, task=task, seed=seed, cycle_name=cycle_name)
-        )
-        preservation_candidate.append(
-            _run_case(args, phase="preservation", role="candidate", library=candidate, suite=suite, task=task, seed=seed, cycle_name=cycle_name)
-        )
-
-    decision = decide_admission(
-        correction_parent=correction_parent,
-        correction_candidate=correction_candidate,
-        preservation_parent=preservation_parent,
-        preservation_candidate=preservation_candidate,
-        target_skill_id=patch.target_skill_id,
-        minimum_activations=args.minimum_activations,
+    source_seeds = sorted({
+        int(material[key]["identity"]["seed"])
+        for key in ("failure_run", "success_run")
+    })
+    replay_parent, replay_candidate = [], []
+    for seed in source_seeds:
+        for repeat in range(args.source_replay_repeats):
+            replay_repeat = 100 + repeat
+            replay_parent.append(_run_case(
+                args, phase="source_replay", role="parent", library=parent,
+                suite=args.suite, task=args.task, seed=seed, repeat=replay_repeat,
+                cycle_name=cycle_name,
+            ))
+            replay_candidate.append(_run_case(
+                args, phase="source_replay", role="candidate", library=candidate,
+                suite=args.suite, task=args.task, seed=seed, repeat=replay_repeat,
+                cycle_name=cycle_name,
+            ))
+    decision_value = _source_admission(
+        _traces_for(replay_parent), _traces_for(replay_candidate), patch.target_skill_id,
     )
-    decision_value = decision.to_dict()
     _write_json(cycle_dir / "admission.json", decision_value)
-    if decision.decision == "accepted":
+    if decision_value["decision"] == "accepted":
         admitted = libraries / next_library_id
         apply_patch(parent, patch, admitted, library_id=next_library_id)
         decision_value["admitted_library"] = str(admitted)
     decision_value.update(
         {
-            "status": decision.decision,
+            "status": decision_value["decision"],
             "parent_library": str(parent),
             "candidate_library": str(candidate),
             "target_skill_id": patch.target_skill_id,

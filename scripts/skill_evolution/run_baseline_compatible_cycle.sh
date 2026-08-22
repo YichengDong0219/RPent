@@ -8,7 +8,7 @@ set -Eeuo pipefail
 # =============================================================================
 # Quick configuration
 # =============================================================================
-EXPERIMENT_NAME="libero_object_t0_natural_language_optimizer_mvp_v1"
+EXPERIMENT_NAME="libero_object_t0_failure_recovery_evolve_v1"
 # Base LIBERO checkout. Standard suites use its assets directly. PRO suites
 # use the installed liberopro assets selected by LIBERO_TYPE while retaining
 # this checkout for the shared LIBERO import surface.
@@ -20,32 +20,46 @@ LIBERO_TYPE="pro"
 EVAL_TASKS=(
   "libero_object_lan:0"
 )
-# Independent seeds shared by every target above. Keep correction seeds held
-# out from discovery so candidate validation does not reuse proposal evidence.
+# Proposal rolls stop at the first grounded self-recovery or matched
+# failure/success material. Evolution happens only after an episode ends.
 DISCOVERY_SEEDS="0,1,2"
-CORRECTION_SEEDS="3,4,5"
-# Use three baseline-proven cases; syntax is SUITE:TASK:SEED separated by ';'.
-PRESERVATION_CASES="libero_spatial_swap:8:0;libero_object_swap:6:0;libero_object_task:0:0;libero_object_object:1:0"
+DISCOVERY_REPEATS=2
+MINIMUM_SIMILARITY=0.65
+# Only replay the source seed(s), as requested for this first version.
+SOURCE_REPLAY_REPEATS=2
 
-# Execution planner (same values as the baseline experiment).
+# Model routing. Each role independently accepts "local" or "remote".
+# Examples:
+#   PLANNER_MODEL_SOURCE=local OPTIMIZER_MODEL_SOURCE=remote bash "$0"
+#   PLANNER_MODEL_SOURCE=remote OPTIMIZER_MODEL_SOURCE=remote bash "$0"
+PLANNER_MODEL_SOURCE="${PLANNER_MODEL_SOURCE:-remote}"
+OPTIMIZER_MODEL_SOURCE="${OPTIMIZER_MODEL_SOURCE:-remote}"
+
+# Local OpenAI-compatible Qwen deployment.
+LOCAL_QWEN_BASE_URL="http://114.212.227.193:8000/v1"
+LOCAL_QWEN_API_KEY="EMPTY"
+LOCAL_PLANNER_MODEL="Qwen3.5-9B"
+LOCAL_OPTIMIZER_MODEL="Qwen3.5-9B"
+
+# Remote Alibaba Cloud Model Studio. The June snapshot is selected explicitly
+# because it supports image input; do not replace it with the text-only preview.
+# Export both variables before selecting either remote backend:
+#   export DASHSCOPE_BASE_URL='https://<WorkspaceId>.cn-beijing.maas.aliyuncs.com/compatible-mode/v1'
+#   export DASHSCOPE_API_KEY='sk-...'
+REMOTE_QWEN_BASE_URL="${DASHSCOPE_BASE_URL:-}"
+REMOTE_QWEN_API_KEY="${DASHSCOPE_API_KEY:-}"
+REMOTE_QWEN_MODEL="${DASHSCOPE_MODEL:-qwen3.7-max-2026-06-08}"
+
+# Execution planner.
 PLANNER="api"
-PLANNER_MODEL="qwen-vl:Qwen3.5-9B"
-QWEN_BASE_URL="http://114.212.227.193:8000/v1"
-QWEN_API_KEY="EMPTY"
 MAX_TOKENS=4096
 MAX_TURNS=40
 
-# Independent stronger multimodal skill optimizer (OpenAI-compatible API).
-SKILL_OPTIMIZER_BASE_URL="http://114.212.227.193:8000/v1"
-SKILL_OPTIMIZER_API_KEY="EMPTY"
-SKILL_OPTIMIZER_MODEL="Qwen3.5-9B"
+# Independent multimodal skill optimizer.
 SKILL_OPTIMIZER_MAX_TOKENS=8192
 SKILL_OPTIMIZER_TIMEOUT_S=600
 SKILL_OPTIMIZER_MAX_IMAGES_PER_ROLLOUT=6
-SKILL_OPTIMIZER_SKILL_PATH="scripts/skill_evolution/skill_optimizer/SKILL.md"
-MAX_PATCH_LINES=24
-MAX_PATCH_NEW_CHARS=2000
-MAX_PATCH_GROWTH_CHARS=1000
+SKILL_OPTIMIZER_SKILL_PATH="scripts/skill_evolution/recovery_optimizer/SKILL.md"
 
 # Pi0.5: same checkpoint, endpoint and unrestricted baseline tool schema.
 PI05_CHECKPOINT="/home/dongyicheng/checkpoints/RLinf-Pi05-LIBERO-130-fullshot-SFT"
@@ -66,6 +80,68 @@ MAX_ATTEMPTS=3
 OUTPUT_ROOT="/home/dongyicheng/rpent/logs/skill_evolution"
 # =============================================================================
 
+case "${PLANNER_MODEL_SOURCE}" in
+  local)
+    PLANNER_BASE_URL="${LOCAL_QWEN_BASE_URL}"
+    PLANNER_API_KEY="${LOCAL_QWEN_API_KEY}"
+    PLANNER_MODEL="qwen-vl:${LOCAL_PLANNER_MODEL}"
+    PLANNER_ENABLE_THINKING=0
+    ;;
+  remote)
+    PLANNER_BASE_URL="${REMOTE_QWEN_BASE_URL}"
+    PLANNER_API_KEY="${REMOTE_QWEN_API_KEY}"
+    PLANNER_MODEL="qwen-vl:${REMOTE_QWEN_MODEL}"
+    PLANNER_ENABLE_THINKING=1
+    ;;
+  *)
+    echo "[skill-evolve] ERROR: PLANNER_MODEL_SOURCE must be local or remote" >&2
+    exit 1
+    ;;
+esac
+
+case "${OPTIMIZER_MODEL_SOURCE}" in
+  local)
+    SKILL_OPTIMIZER_BASE_URL="${LOCAL_QWEN_BASE_URL}"
+    SKILL_OPTIMIZER_API_KEY="${LOCAL_QWEN_API_KEY}"
+    SKILL_OPTIMIZER_MODEL="${LOCAL_OPTIMIZER_MODEL}"
+    OPTIMIZER_ENABLE_THINKING=0
+    ;;
+  remote)
+    SKILL_OPTIMIZER_BASE_URL="${REMOTE_QWEN_BASE_URL}"
+    SKILL_OPTIMIZER_API_KEY="${REMOTE_QWEN_API_KEY}"
+    SKILL_OPTIMIZER_MODEL="${REMOTE_QWEN_MODEL}"
+    OPTIMIZER_ENABLE_THINKING=1
+    ;;
+  *)
+    echo "[skill-evolve] ERROR: OPTIMIZER_MODEL_SOURCE must be local or remote" >&2
+    exit 1
+    ;;
+esac
+
+if [[ "${PLANNER_MODEL_SOURCE}" == "remote" || "${OPTIMIZER_MODEL_SOURCE}" == "remote" ]]; then
+  if [[ -z "${REMOTE_QWEN_BASE_URL}" || -z "${REMOTE_QWEN_API_KEY}" ]]; then
+    echo "[skill-evolve] ERROR: remote model source requires DASHSCOPE_BASE_URL and DASHSCOPE_API_KEY" >&2
+    exit 1
+  fi
+  if [[ ! "${REMOTE_QWEN_BASE_URL}" =~ ^https://[^/]+/compatible-mode/v1/?$ ]]; then
+    echo "[skill-evolve] ERROR: DASHSCOPE_BASE_URL must be a workspace-specific HTTPS compatible-mode/v1 URL" >&2
+    exit 1
+  fi
+fi
+
+PLANNER_THINKING_ARGS=()
+OPTIMIZER_THINKING_ARGS=()
+PLANNER_RUN_THINKING_ARGS=()
+OPTIMIZER_RUN_THINKING_ARGS=()
+if [[ "${PLANNER_ENABLE_THINKING}" == "1" ]]; then
+  PLANNER_THINKING_ARGS+=(--enable-thinking)
+  PLANNER_RUN_THINKING_ARGS+=(--planner-enable-thinking)
+fi
+if [[ "${OPTIMIZER_ENABLE_THINKING}" == "1" ]]; then
+  OPTIMIZER_THINKING_ARGS+=(--enable-thinking)
+  OPTIMIZER_RUN_THINKING_ARGS+=(--optimizer-enable-thinking)
+fi
+
 source "${CONDA_ROOT}/etc/profile.d/conda.sh"
 conda activate "${CONDA_ENV}"
 unset __EGL_VENDOR_LIBRARY_DIRS
@@ -73,7 +149,11 @@ unset __EGL_VENDOR_LIBRARY_DIRS
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 PYTHON_BIN="${CONDA_PREFIX}/bin/python"
-EXPERIMENT_DIR="${OUTPUT_ROOT}/${EXPERIMENT_NAME}"
+# Keep accepted skill chains isolated across backend choices. Mixing a local
+# planner cycle with a remote planner cycle would break the frozen-planner
+# assumption used by source replay admission.
+EXPERIMENT_VARIANT="${EXPERIMENT_NAME}__p-${PLANNER_MODEL_SOURCE}__o-${OPTIMIZER_MODEL_SOURCE}"
+EXPERIMENT_DIR="${OUTPUT_ROOT}/${EXPERIMENT_VARIANT}"
 SERVICES_DIR="${EXPERIMENT_DIR}/services"
 mkdir -p "${SERVICES_DIR}"
 
@@ -109,8 +189,10 @@ fi
 # Pin imports to the user-selected LIBERO checkout without editing that repo.
 export PYTHONPATH="${LIBERO_CHECKOUT}/libero:${PYTHONPATH:-}"
 export LIBERO_TYPE
-export QWEN_VL_BASE_URL="${QWEN_BASE_URL}"
-export QWEN_VL_API_KEY="${QWEN_API_KEY}"
+export QWEN_VL_BASE_URL="${PLANNER_BASE_URL}"
+export QWEN_VL_API_KEY="${PLANNER_API_KEY}"
+export RPENT_PLANNER_API_KEY="${PLANNER_API_KEY}"
+export RPENT_OPTIMIZER_API_KEY="${SKILL_OPTIMIZER_API_KEY}"
 export HF_HUB_OFFLINE=1
 export NO_PROXY="${NO_PROXY:-127.0.0.1,localhost}"
 export no_proxy="${no_proxy:-127.0.0.1,localhost}"
@@ -136,15 +218,17 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 cd "${REPO_ROOT}"
+echo "[skill-evolve] planner: source=${PLANNER_MODEL_SOURCE} model=${PLANNER_MODEL} endpoint=${PLANNER_BASE_URL}"
+echo "[skill-evolve] optimizer: source=${OPTIMIZER_MODEL_SOURCE} model=${SKILL_OPTIMIZER_MODEL} endpoint=${SKILL_OPTIMIZER_BASE_URL}"
 "${PYTHON_BIN}" scripts/qwen_vl/check_server.py \
-  --base-url "${QWEN_BASE_URL}" \
-  --api-key "${QWEN_API_KEY}" \
-  --model "${PLANNER_MODEL#qwen-vl:}"
+  --base-url "${PLANNER_BASE_URL}" \
+  --model "${PLANNER_MODEL#qwen-vl:}" \
+  "${PLANNER_THINKING_ARGS[@]}"
 "${PYTHON_BIN}" -m rpent.evolution.cli check-optimizer \
   --base-url "${SKILL_OPTIMIZER_BASE_URL}" \
-  --api-key "${SKILL_OPTIMIZER_API_KEY}" \
   --model "${SKILL_OPTIMIZER_MODEL}" \
-  --timeout-s 60
+  --timeout-s 60 \
+  "${OPTIMIZER_THINKING_ARGS[@]}"
 
 if [[ "${START_SHARED_VLA}" == "1" ]]; then
   VLA_STDIN_FIFO="${SERVICES_DIR}/vla_stdin.fifo"
@@ -205,20 +289,21 @@ for task_index in "${!EVAL_SUITES[@]}"; do
     --memory-dir "${REPO_ROOT}/resources/libero/memory" \
     --suite "${eval_suite}" --task "${eval_task_id}" \
     --discovery-seeds "${DISCOVERY_SEEDS}" \
-    --correction-seeds "${CORRECTION_SEEDS}" \
-    --preservation-cases "${PRESERVATION_CASES}" \
+    --discovery-repeats "${DISCOVERY_REPEATS}" \
+    --minimum-similarity "${MINIMUM_SIMILARITY}" \
+    --source-replay-repeats "${SOURCE_REPLAY_REPEATS}" \
     --planner "${PLANNER}" --model "${PLANNER_MODEL}" \
-    --qwen-base-url "${QWEN_BASE_URL}" --qwen-api-key "${QWEN_API_KEY}" \
+    --planner-model-source "${PLANNER_MODEL_SOURCE}" \
+    --qwen-base-url "${PLANNER_BASE_URL}" \
+    "${PLANNER_RUN_THINKING_ARGS[@]}" \
     --optimizer-base-url "${SKILL_OPTIMIZER_BASE_URL}" \
-    --optimizer-api-key "${SKILL_OPTIMIZER_API_KEY}" \
+    --optimizer-model-source "${OPTIMIZER_MODEL_SOURCE}" \
     --optimizer-model "${SKILL_OPTIMIZER_MODEL}" \
+    "${OPTIMIZER_RUN_THINKING_ARGS[@]}" \
     --optimizer-max-tokens "${SKILL_OPTIMIZER_MAX_TOKENS}" \
     --optimizer-timeout-s "${SKILL_OPTIMIZER_TIMEOUT_S}" \
     --optimizer-max-images-per-rollout "${SKILL_OPTIMIZER_MAX_IMAGES_PER_ROLLOUT}" \
     --optimizer-skill-path "${REPO_ROOT}/${SKILL_OPTIMIZER_SKILL_PATH}" \
-    --max-patch-lines "${MAX_PATCH_LINES}" \
-    --max-patch-new-chars "${MAX_PATCH_NEW_CHARS}" \
-    --max-patch-growth-chars "${MAX_PATCH_GROWTH_CHARS}" \
     --vla-endpoint "${VLA_ENDPOINT}" --libero-type "${LIBERO_TYPE}" \
     --cuda-device "${VLA_GPU}" --max-tokens "${MAX_TOKENS}" \
     --max-turns "${MAX_TURNS}" \

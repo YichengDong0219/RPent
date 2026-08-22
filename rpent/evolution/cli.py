@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -88,9 +89,12 @@ def _parser() -> argparse.ArgumentParser:
 
     check = sub.add_parser("check-optimizer")
     check.add_argument("--base-url", required=True)
-    check.add_argument("--api-key", default="EMPTY")
+    check.add_argument(
+        "--api-key", default=os.environ.get("RPENT_OPTIMIZER_API_KEY", "EMPTY")
+    )
     check.add_argument("--model", required=True)
     check.add_argument("--timeout-s", type=int, default=60)
+    check.add_argument("--enable-thinking", action="store_true")
 
     admit = sub.add_parser("admit")
     admit.add_argument("--correction-parent", action="append", required=True)
@@ -177,6 +181,7 @@ def main() -> int:
             api_key=args.api_key,
             model=args.model,
             timeout_s=args.timeout_s,
+            enable_thinking=args.enable_thinking,
         )
         print(json.dumps({"status": "ready", "model": args.model}, indent=2))
     elif args.command == "admit":

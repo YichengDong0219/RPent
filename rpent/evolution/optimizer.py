@@ -310,7 +310,10 @@ def optimize_skills(
     raise OptimizerProtocolError(f"optimizer schema invalid after repair: {last_error}")
 
 
-def check_optimizer_service(*, base_url: str, api_key: str, model: str, timeout_s: int = 60) -> None:
+def check_optimizer_service(
+    *, base_url: str, api_key: str, model: str, timeout_s: int = 60,
+    enable_thinking: bool = False,
+) -> None:
     models_url = base_url.rstrip("/") + "/models"
     request = urllib.request.Request(models_url, headers={"Authorization": f"Bearer {api_key}"})
     try:
@@ -327,9 +330,11 @@ def check_optimizer_service(*, base_url: str, api_key: str, model: str, timeout_
             {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{red}"}},
         ]}],
         "temperature": 0,
-        "max_tokens": 128,
+        "max_tokens": 1024 if enable_thinking else 128,
         "response_format": {"type": "json_object"},
     }
+    if enable_thinking:
+        body["enable_thinking"] = True
     response = _post_json(base_url.rstrip("/") + "/chat/completions", api_key, body, timeout_s)
     try:
         _extract_json(response["choices"][0]["message"]["content"])

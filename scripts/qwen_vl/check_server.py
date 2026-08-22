@@ -5,11 +5,13 @@ from __future__ import annotations
 
 import argparse
 import base64
+import ipaddress
 import json
 import os
 import struct
 import sys
 import zlib
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -76,19 +78,22 @@ def main() -> int:
         help="Served model name; defaults to the first entry from /v1/models.",
     )
     parser.add_argument("--timeout", type=float, default=300.0)
+    parser.add_argument("--enable-thinking", action="store_true")
     args = parser.parse_args()
 
     base_url = args.base_url.rstrip("/")
     headers = {"Authorization": f"Bearer {args.api_key}"}
 
     try:
-        # The endpoint is a local vLLM service. Do not inherit HTTP(S) or SOCKS
-        # proxy variables, which can otherwise require the optional socksio
-        # package before any request reaches localhost.
+        host = urlsplit(base_url).hostname or ""
+        try:
+            local_endpoint = host.lower() == "localhost" or ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            local_endpoint = host.lower() == "localhost"
         with httpx.Client(
             headers=headers,
             timeout=args.timeout,
-            trust_env=False,
+            trust_env=not local_endpoint,
         ) as client:
             models_response = client.get(f"{base_url}/models")
             models_response.raise_for_status()
@@ -98,6 +103,7 @@ def main() -> int:
                 raise RuntimeError("GET /models returned no model ids")
             print(f"models endpoint: OK ({model})")
 
+            thinking = {"enable_thinking": True} if args.enable_thinking else {}
             vision = _request(
                 client,
                 base_url,
@@ -122,7 +128,8 @@ def main() -> int:
                         }
                     ],
                     # Qwen3.5 emits reasoning before its final answer.
-                    "max_tokens": 512,
+                    "max_tokens": 2048 if args.enable_thinking else 512,
+                    **thinking,
                 },
             )
             vision_text = (
@@ -165,7 +172,8 @@ def main() -> int:
                     ],
                     "tool_choice": "auto",
                     # Leave enough room for reasoning plus the structured call.
-                    "max_tokens": 512,
+                    "max_tokens": 2048 if args.enable_thinking else 512,
+                    **thinking,
                 },
             )
             message = tool_result.get("choices", [{}])[0].get("message", {})

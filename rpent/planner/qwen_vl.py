@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import os
 from urllib.parse import urlsplit
 
@@ -44,9 +45,9 @@ def build_qwen_vl_model(
         base_url or os.environ.get("QWEN_VL_BASE_URL") or DEFAULT_QWEN_VL_BASE_URL
     )
     api_key = os.environ.get("QWEN_VL_API_KEY") or "EMPTY"
-    # This provider targets a local service. Ignoring HTTP(S)/ALL_PROXY avoids
-    # both unnecessary loopback proxying and an optional socksio dependency.
-    http_client = DefaultAsyncHttpxClient(trust_env=False)
+    # Local vLLM must bypass proxy variables; remote Model Studio endpoints
+    # should honor the host's normal proxy/CA configuration.
+    http_client = DefaultAsyncHttpxClient(trust_env=not _is_local_endpoint(endpoint))
     provider = OpenAIProvider(
         base_url=endpoint,
         api_key=api_key,
@@ -66,3 +67,13 @@ def _normalize_base_url(value: str) -> str:
     if parsed.path in {"", "/"}:
         endpoint += "/v1"
     return endpoint
+
+
+def _is_local_endpoint(value: str) -> bool:
+    host = urlsplit(value).hostname or ""
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
