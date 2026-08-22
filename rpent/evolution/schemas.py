@@ -90,7 +90,7 @@ class RecoveryRowDecision(BaseModel):
     schema_version: Literal["RecoveryRowDecision/v1"] = "RecoveryRowDecision/v1"
     decision: Literal["patch", "no_patch"]
     target_skill_id: str | None = None
-    material_kind: Literal["self_recovery", "contrast", "none"]
+    material_kind: Literal["self_recovery", "contrast", "diagnostic_mismatch", "none"]
     similar_state: bool
     causal_summary: str
     failure_mode: str = ""

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import re
@@ -60,15 +61,52 @@ def classify_failure(action: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
+def _is_diagnostic_mismatch(
+    action: dict[str, Any], following: list[dict[str, Any]], benchmark_success: bool,
+) -> bool:
+    """Recognize a false-negative pick only with a successful normal suffix."""
+    diagnostics = action.get("diagnostics", {})
+    peak_lift = diagnostics.get("peak_lift_m")
+    lift_threshold = (action.get("arguments") or {}).get("lift_thresh", 0.05)
+    tools = [item.get("tool") for item in following]
+    normal_suffix = (
+        any(tool in {"move_to", "move_pose"} for tool in tools)
+        and "release" in tools
+        and not any(tool in {"pi0_pick", "pi0_doubled", "set_gripper"} for tool in tools)
+    )
+    return bool(
+        benchmark_success
+        and action.get("tool") == "pi0_pick"
+        and diagnostics.get("success") is False
+        and isinstance(peak_lift, (int, float))
+        and isinstance(lift_threshold, (int, float))
+        and peak_lift >= lift_threshold
+        and normal_suffix
+    )
+
+
 def build_recovery_trace(evidence: dict[str, Any], output_path: str | Path) -> dict[str, Any]:
     """Create one compact JSONL record after an episode has fully ended."""
     actions = [_compact_action(item) for item in evidence.get("actions", [])]
+    benchmark_success = bool(evidence.get("outcome", {}).get("benchmark_success"))
     anchors = []
     for index, action in enumerate(actions):
         failure = classify_failure(action)
         if not failure:
             continue
         target = _last_skill_before(evidence, action.get("call_event_id"))
+        full_following = actions[index + 1:]
+        following = full_following[:6]
+        if _is_diagnostic_mismatch(action, full_following, benchmark_success):
+            peak_lift = action["diagnostics"]["peak_lift_m"]
+            lift_threshold = action.get("arguments", {}).get("lift_thresh", 0.05)
+            failure = {
+                "kind": "diagnostic_mismatch",
+                "observable": (
+                    f"success=false but peak_lift_m={peak_lift} "
+                    f">= lift_thresh={lift_threshold}; normal carry/release reached benchmark success"
+                ),
+            }
         anchors.append(
             {
                 "action_index": index,
@@ -76,7 +114,7 @@ def build_recovery_trace(evidence: dict[str, Any], output_path: str | Path) -> d
                 "failure": failure,
                 "failed_action": action,
                 "prefix": actions[max(0, index - 3):index],
-                "following_actions": actions[index + 1:index + 5],
+                "following_actions": following,
             }
         )
     if (
@@ -109,7 +147,11 @@ def build_recovery_trace(evidence: dict[str, Any], output_path: str | Path) -> d
         "valid_for_evolution": valid,
         "actions": actions,
         "failure_anchors": anchors,
-        "self_recovery": success and any(item["following_actions"] for item in anchors),
+        "self_recovery": success and any(
+            item["following_actions"]
+            and item["failure"].get("kind") != "diagnostic_mismatch"
+            for item in anchors
+        ),
         "visual_evidence": evidence.get("visual_evidence", []),
         "cost": evidence.get("cost", {}),
         "provenance": evidence.get("provenance", {}),
@@ -169,24 +211,73 @@ def _prefix_similarity(anchor: dict[str, Any], success_actions: list[dict[str, A
     return state if behavior is None else 0.65 * behavior + 0.35 * state
 
 
-def select_recovery_material(traces: list[dict[str, Any]], *, minimum_similarity: float = 0.65) -> dict[str, Any] | None:
-    """Prefer a successful in-trajectory recovery, then a matched failure/success pair."""
+def _run_id(trace: dict[str, Any]) -> str:
+    return str(trace.get("identity", {}).get("run_id") or "unknown")
+
+
+def _with_material_id(material: dict[str, Any]) -> dict[str, Any]:
+    anchor = material["anchor"]
+    identity = {
+        "kind": material["kind"],
+        "target_skill_id": material["target_skill_id"],
+        "failure_run_id": _run_id(material["failure_run"]),
+        "success_run_id": _run_id(material["success_run"]),
+        "failure_event_id": anchor.get("failed_action", {}).get("call_event_id"),
+    }
+    digest = hashlib.sha256(
+        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()[:16]
+    material["material_id"] = f"material-{digest}"
+    return material
+
+
+def select_recovery_material(
+    traces: list[dict[str, Any]], *, focus_run_id: str | None = None,
+    attempted_material_ids: set[str] | None = None,
+    minimum_similarity: float = 0.65,
+) -> dict[str, Any] | None:
+    """Return the best untried material that includes the newest rollout.
+
+    The evidence bank is local state only.  A returned material contains the
+    focus trace plus, for contrast, at most one historical matching trace.
+    """
     valid = [item for item in traces if item.get("valid_for_evolution")]
-    for trace in valid:
-        if not trace.get("self_recovery"):
-            continue
-        anchors = [a for a in trace.get("failure_anchors", []) if a.get("target_skill_id")]
-        if anchors:
-            anchor = anchors[-1]
-            return {
-                "schema_version": "RecoveryMaterial/v1", "kind": "self_recovery",
-                "target_skill_id": anchor["target_skill_id"], "similarity": 1.0,
-                "failure_run": trace, "success_run": trace, "anchor": anchor,
-                "successful_next_action": anchor["following_actions"][0],
-            }
+    if not valid:
+        return None
+    focus = next(
+        (item for item in reversed(valid) if _run_id(item) == focus_run_id),
+        valid[-1] if focus_run_id is None else None,
+    )
+    if focus is None:
+        return None
+    attempted = attempted_material_ids or set()
+    candidates: list[tuple[tuple[int, int, float], dict[str, Any]]] = []
+
+    if focus.get("outcome", {}).get("benchmark_success"):
+        for anchor in focus.get("failure_anchors", []):
+            target = anchor.get("target_skill_id")
+            following = anchor.get("following_actions", [])
+            if not target or not following:
+                continue
+            diagnostic = anchor.get("failure", {}).get("kind") == "diagnostic_mismatch"
+            material = _with_material_id({
+                "schema_version": "RecoveryMaterial/v1",
+                "kind": "diagnostic_mismatch" if diagnostic else "self_recovery",
+                "target_skill_id": target,
+                "similarity": 1.0,
+                "failure_run": focus,
+                "success_run": focus,
+                "anchor": anchor,
+                "successful_next_action": following[0],
+                "latest_run_id": _run_id(focus),
+            })
+            if material["material_id"] not in attempted:
+                # Explicit physical self-recovery outranks all contrasts;
+                # diagnostic mismatches remain eligible at lowest priority.
+                candidates.append(((1 if diagnostic else 4, 1, 1.0), material))
+
     failures = [item for item in valid if not item.get("outcome", {}).get("benchmark_success")]
     successes = [item for item in valid if item.get("outcome", {}).get("benchmark_success")]
-    candidates = []
     for failed in failures:
         for anchor in failed.get("failure_anchors", []):
             target = anchor.get("target_skill_id")
@@ -194,25 +285,30 @@ def select_recovery_material(traces: list[dict[str, Any]], *, minimum_similarity
                 continue
             index = int(anchor["action_index"])
             for success in successes:
-                if target not in {x for a in success.get("actions", []) for x in a.get("active_skill_ids", [])}:
+                if (focus is not failed and focus is not success) or failed is success:
                     continue
-                if index >= len(success.get("actions", [])):
+                active = {x for action in success.get("actions", []) for x in action.get("active_skill_ids", [])}
+                if target not in active or index >= len(success.get("actions", [])):
                     continue
-                left = anchor["failed_action"]
-                right = success["actions"][index]
+                left, right = anchor["failed_action"], success["actions"][index]
                 score = _prefix_similarity(anchor, success["actions"])
+                if score < minimum_similarity:
+                    continue
+                if (left.get("tool"), left.get("arguments")) == (right.get("tool"), right.get("arguments")):
+                    continue
                 same_seed = failed.get("identity", {}).get("seed") == success.get("identity", {}).get("seed")
-                if score >= minimum_similarity and (left.get("tool"), left.get("arguments")) != (right.get("tool"), right.get("arguments")):
-                    candidates.append((same_seed, score, failed, success, anchor, right))
+                material = _with_material_id({
+                    "schema_version": "RecoveryMaterial/v1", "kind": "contrast",
+                    "target_skill_id": target, "similarity": round(score, 4),
+                    "same_seed": same_seed, "failure_run": failed, "success_run": success,
+                    "anchor": anchor, "successful_next_action": right,
+                    "latest_run_id": _run_id(focus),
+                })
+                if material["material_id"] not in attempted:
+                    candidates.append(((3 if same_seed else 2, int(same_seed), score), material))
     if not candidates:
         return None
-    same_seed, score, failed, success, anchor, next_action = max(candidates, key=lambda x: (x[0], x[1]))
-    return {
-        "schema_version": "RecoveryMaterial/v1", "kind": "contrast",
-        "target_skill_id": anchor["target_skill_id"], "similarity": round(score, 4),
-        "same_seed": same_seed, "failure_run": failed, "success_run": success,
-        "anchor": anchor, "successful_next_action": next_action,
-    }
+    return max(candidates, key=lambda item: item[0])[1]
 
 
 def source_metrics(trace: dict[str, Any], target_skill_id: str) -> dict[str, int | bool]:

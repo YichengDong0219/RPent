@@ -59,6 +59,7 @@ def compact_material(material: dict[str, Any]) -> dict[str, Any]:
     success = material["success_run"]
     return {
         "schema_version": material["schema_version"],
+        "material_id": material.get("material_id"),
         "kind": material["kind"], "target_skill_id": material["target_skill_id"],
         "structured_similarity": material.get("similarity"),
         "same_seed": material.get("same_seed"),

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import base64
 import json
+import struct
 
 from rpent.evolution.recovery import (
     build_recovery_trace, classify_failure, select_recovery_material, source_metrics,
 )
 from rpent.evolution.recovery_optimizer import _append_row, compact_material
+from rpent.evolution.optimizer import _solid_png_data_url
 
 
 def _action(tool: str, event: int, *, success=None, x=0.0):
@@ -57,6 +60,21 @@ def test_self_recovery_is_preferred(tmp_path):
     assert compact_material(material)["failure_run_id"] == "recovered"
 
 
+def test_diagnostic_false_negative_is_not_physical_recovery(tmp_path):
+    pick = _action("pi0_pick", 3, success=False)
+    pick["arguments"]["lift_thresh"] = 0.05
+    pick["diagnostics"]["peak_lift_m"] = 0.08
+    trace = build_recovery_trace(
+        _evidence("false-negative", True, [pick, _action("move_to", 5), _action("release", 7)]),
+        tmp_path / "trace.jsonl",
+    )
+    assert trace["failure_anchors"][0]["failure"]["kind"] == "diagnostic_mismatch"
+    assert trace["self_recovery"] is False
+    material = select_recovery_material([trace])
+    assert material is not None
+    assert material["kind"] == "diagnostic_mismatch"
+
+
 def test_contrast_matches_prefix_state_before_a_different_next_tool(tmp_path):
     failed_actions = [_action("move_to", 3), _action("pi0_pick", 5, success=False)]
     success_actions = [_action("move_to", 13), _action("pi0_doubled", 15), _action("release", 17)]
@@ -66,6 +84,34 @@ def test_contrast_matches_prefix_state_before_a_different_next_tool(tmp_path):
     assert material is not None
     assert material["kind"] == "contrast"
     assert material["successful_next_action"]["tool"] == "pi0_doubled"
+
+
+def test_material_must_include_focus_and_is_attempted_once(tmp_path):
+    failed = build_recovery_trace(
+        _evidence("old-failed", False, [_action("move_to", 3), _action("pi0_pick", 5, success=False)]),
+        tmp_path / "f.jsonl",
+    )
+    succeeded = build_recovery_trace(
+        _evidence("new-success", True, [_action("move_to", 13), _action("pi0_doubled", 15)]),
+        tmp_path / "s.jsonl",
+    )
+    material = select_recovery_material(
+        [failed, succeeded], focus_run_id="new-success", minimum_similarity=0.65,
+    )
+    assert material is not None
+    assert material["latest_run_id"] == "new-success"
+    assert select_recovery_material(
+        [failed, succeeded], focus_run_id="new-success",
+        attempted_material_ids={material["material_id"]}, minimum_similarity=0.65,
+    ) is None
+
+    unrelated = build_recovery_trace(
+        _evidence("latest-unrelated", False, []), tmp_path / "u.jsonl",
+    )
+    assert select_recovery_material(
+        [failed, succeeded, unrelated], focus_run_id="latest-unrelated",
+        minimum_similarity=0.65,
+    ) is None
 
 
 def test_failure_section_compiler_only_adds_one_entry():
@@ -89,3 +135,11 @@ def test_source_metrics_are_target_specific(tmp_path):
         "success": False, "failure_anchors": 1, "recovery_actions": 0,
         "turns": 4, "target_active": True,
     }
+
+
+def test_optimizer_probe_image_meets_hosted_vlm_minimum_dimensions():
+    encoded = _solid_png_data_url()
+    raw = base64.b64decode(encoded.split(",", 1)[1])
+    width, height = struct.unpack(">II", raw[16:24])
+    assert width > 10
+    assert height > 10

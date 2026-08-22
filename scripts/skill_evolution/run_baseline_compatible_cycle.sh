@@ -20,10 +20,13 @@ LIBERO_TYPE="pro"
 EVAL_TASKS=(
   "libero_object_lan:0"
 )
-# Proposal rolls stop at the first grounded self-recovery or matched
-# failure/success material. Evolution happens only after an episode ends.
+# Each cycle spends at most this many logical proposal rollouts. Seeds are
+# scheduled round-robin; per-seed repeat indices are assigned automatically.
 DISCOVERY_SEEDS="0,1,2"
-DISCOVERY_REPEATS=2
+MAX_PROPOSAL_ROLLOUTS=6
+# Only an admitted and published skill advances a cycle. A budget-exhausted
+# cycle stops the task; successful cycles advance automatically up to this cap.
+MAX_EVOLUTION_CYCLES=3
 MINIMUM_SIMILARITY=0.65
 # Only replay the source seed(s), as requested for this first version.
 SOURCE_REPLAY_REPEATS=2
@@ -46,7 +49,7 @@ LOCAL_OPTIMIZER_MODEL="Qwen3.5-9B"
 # Export both variables before selecting either remote backend:
 #   export DASHSCOPE_BASE_URL='https://<WorkspaceId>.cn-beijing.maas.aliyuncs.com/compatible-mode/v1'
 #   export DASHSCOPE_API_KEY='sk-...'
-REMOTE_QWEN_BASE_URL="${DASHSCOPE_BASE_URL:-}"
+REMOTE_QWEN_BASE_URL="${DASHSCOPE_BASE_URL:-https://ws-pqrmf0s1yunv21h8.cn-beijing.maas.aliyuncs.com/compatible-mode/v1}"
 REMOTE_QWEN_API_KEY="${DASHSCOPE_API_KEY:-}"
 REMOTE_QWEN_MODEL="${DASHSCOPE_MODEL:-qwen3.7-max-2026-06-08}"
 
@@ -289,7 +292,8 @@ for task_index in "${!EVAL_SUITES[@]}"; do
     --memory-dir "${REPO_ROOT}/resources/libero/memory" \
     --suite "${eval_suite}" --task "${eval_task_id}" \
     --discovery-seeds "${DISCOVERY_SEEDS}" \
-    --discovery-repeats "${DISCOVERY_REPEATS}" \
+    --max-proposal-rollouts "${MAX_PROPOSAL_ROLLOUTS}" \
+    --max-evolution-cycles "${MAX_EVOLUTION_CYCLES}" \
     --minimum-similarity "${MINIMUM_SIMILARITY}" \
     --source-replay-repeats "${SOURCE_REPLAY_REPEATS}" \
     --planner "${PLANNER}" --model "${PLANNER_MODEL}" \

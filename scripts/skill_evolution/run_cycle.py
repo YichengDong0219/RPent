@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run one episode-boundary failure-to-recovery skill evolution cycle."""
+"""Run incremental episode-boundary failure-to-recovery evolution cycles."""
 
 from __future__ import annotations
 
@@ -37,6 +37,25 @@ def _csv_ints(value: str) -> list[int]:
 def _write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+
+
+def _append_jsonl(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as stream:
+        stream.write(json.dumps(value, ensure_ascii=False) + "\n")
+
+
+def _proposal_schedule(seeds: list[int], limit: int) -> list[tuple[int, int]]:
+    if not seeds:
+        raise ValueError("discovery seeds must not be empty")
+    counts = {seed: 0 for seed in seeds}
+    schedule = []
+    for slot in range(limit):
+        seed = seeds[slot % len(seeds)]
+        repeat = counts[seed]
+        counts[seed] += 1
+        schedule.append((seed, repeat))
+    return schedule
 
 
 def _prepare_libero(args: argparse.Namespace) -> Path:
@@ -307,6 +326,8 @@ def _next_cycle(experiment_dir: Path) -> tuple[Path, str]:
 def _evidence_for(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
     values = []
     for result in results:
+        if result.get("status") not in VALID_STATUSES:
+            continue
         path = result.get("optimizer_evidence")
         if path and Path(path).is_file():
             values.append(json.loads(Path(path).read_text()))
@@ -316,6 +337,8 @@ def _evidence_for(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def _traces_for(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
     values = []
     for result in results:
+        if result.get("status") not in VALID_STATUSES:
+            continue
         path = result.get("failure_recovery_trace")
         if path and Path(path).is_file():
             values.append(load_recovery_trace(path))
@@ -371,7 +394,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--suite", required=True)
     parser.add_argument("--task", type=int, required=True)
     parser.add_argument("--discovery-seeds", default="0,1,2")
-    parser.add_argument("--discovery-repeats", type=int, default=2)
+    parser.add_argument("--max-proposal-rollouts", type=int, default=6)
+    parser.add_argument("--max-evolution-cycles", type=int, default=3)
     parser.add_argument("--source-replay-repeats", type=int, default=2)
     parser.add_argument("--minimum-similarity", type=float, default=0.65)
     parser.add_argument("--planner", default="api")
@@ -407,28 +431,9 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> int:
-    args = _parser().parse_args()
-    args.repo_root = args.repo_root.resolve()
-    args.libero_root = args.libero_root.resolve()
-    args.experiment_dir = args.experiment_dir.resolve()
-    if args.planner_model_source == "remote":
-        if not args.qwen_base_url.startswith("https://") or args.qwen_api_key in {"", "EMPTY"}:
-            raise ValueError("remote planner requires an HTTPS base URL and RPENT_PLANNER_API_KEY")
-        if "qwen3.7-max" in args.model.lower() and not args.planner_enable_thinking:
-            raise ValueError("remote Qwen3.7-Max planner requires --planner-enable-thinking")
-    if args.optimizer_model_source == "remote":
-        if not args.optimizer_base_url.startswith("https://") or args.optimizer_api_key in {"", "EMPTY"}:
-            raise ValueError("remote optimizer requires an HTTPS base URL and RPENT_OPTIMIZER_API_KEY")
-        if "qwen3.7-max" in args.optimizer_model.lower() and not args.optimizer_enable_thinking:
-            raise ValueError("remote Qwen3.7-Max optimizer requires --optimizer-enable-thinking")
-    args.experiment_dir.mkdir(parents=True, exist_ok=True)
-    runtime_libero_root = _prepare_libero(args)
-    libraries = args.experiment_dir / "libraries"
-    initial = libraries / "S000"
-    if not initial.exists():
-        print("[skill-evolve] snapshot exact baseline MEMORY -> S000", flush=True)
-        create_snapshot(args.memory_dir, initial, library_id="S000")
+def _run_evolution_cycle(
+    args: argparse.Namespace, *, runtime_libero_root: Path, libraries: Path,
+) -> dict[str, Any]:
     parent, parent_number = _latest_accepted_library(libraries)
     cycle_dir, cycle_name = _next_cycle(args.experiment_dir)
     optimizer_dir = cycle_dir / "optimizer"
@@ -460,150 +465,248 @@ def main() -> int:
     _write_json(cycle_dir / "resolved_config.json", resolved)
 
     discovery: list[dict[str, Any]] = []
-    material = None
-    for seed in _csv_ints(args.discovery_seeds):
-        for repeat in range(args.discovery_repeats):
-            discovery.append(_run_case(
-                args, phase="proposal", role="parent", library=parent,
-                suite=args.suite, task=args.task, seed=seed, repeat=repeat,
-                cycle_name=cycle_name,
-            ))
-            material = select_recovery_material(
-                _traces_for(discovery), minimum_similarity=args.minimum_similarity,
-            )
-            if material is not None:
-                print(
-                    f"[skill-evolve] episode-boundary material ready: {material['kind']} "
-                    f"target={material['target_skill_id']}", flush=True,
-                )
-                break
-        if material is not None:
-            break
-    discovery_evidence = _evidence_for(discovery)
-    if discovery_evidence:
-        batch = aggregate_evidence(discovery_evidence)
-        _write_json(optimizer_dir / "evidence.json", batch)
-        _write_json(
-            optimizer_dir / "image_manifest.json",
-            [
-                {**image, "run_id": item["identity"]["run_id"]}
-                for item in discovery_evidence
-                for image in item.get("visual_evidence", [])
-            ],
-        )
-    if material is None:
-        value = {
-            "status": "no_patch",
-            "decision": "no_patch",
-            "problem_type": "insufficient_evidence",
-            "reason": "no grounded self-recovery or similar failure/success pair",
-            "parent_library": str(parent),
-        }
-        _write_json(cycle_dir / "cycle_result.json", value)
-        print(json.dumps(value, ensure_ascii=False, indent=2))
-        return 0
+    attempted_material_ids: set[str] = set()
+    attempt_summaries: list[dict[str, Any]] = []
+    valid_rollouts = 0
+    optimizer_calls = 0
 
-    try:
-        _write_json(optimizer_dir / "recovery_material.json", material)
-        decision, patch = optimize_recovery(
-            material=material,
-            memory_dir=rendered_memory_dir(parent),
-            skill_path=args.optimizer_skill_path,
-            base_url=args.optimizer_base_url,
-            api_key=args.optimizer_api_key,
-            model=args.optimizer_model,
-            output_dir=optimizer_dir,
-            max_tokens=args.optimizer_max_tokens,
-            timeout_s=args.optimizer_timeout_s,
-            enable_thinking=args.optimizer_enable_thinking,
-            model_source=args.optimizer_model_source,
-        )
-    except OptimizerInfrastructureError as exc:
+    def finish(status: str, decision: str, stop_reason: str, **extra: Any) -> dict[str, Any]:
         value = {
-            "status": "pending",
-            "decision": "pending",
-            "reason": "optimizer_infrastructure_error",
-            "detail": str(exc),
+            "status": status,
+            "decision": decision,
+            "stop_reason": stop_reason,
             "parent_library": str(parent),
+            "next_library_id": next_library_id,
+            "proposal_rollouts_used": len(discovery),
+            "max_proposal_rollouts": args.max_proposal_rollouts,
+            "valid_rollouts": valid_rollouts,
+            "optimizer_calls": optimizer_calls,
+            "optimizer_attempts": attempt_summaries,
+            **extra,
         }
         _write_json(cycle_dir / "cycle_result.json", value)
         print(json.dumps(value, ensure_ascii=False, indent=2))
-        return 2
-    except OptimizerProtocolError as exc:
-        value = {
-            "status": "pending",
-            "decision": "pending",
-            "reason": "optimizer_protocol_error",
-            "detail": str(exc),
-            "parent_library": str(parent),
-        }
-        _write_json(cycle_dir / "cycle_result.json", value)
-        print(json.dumps(value, ensure_ascii=False, indent=2))
-        return 2
-    except InvalidPatchError as exc:
-        value = {
-            "status": "rejected",
-            "decision": "rejected",
-            "reason": "invalid_patch",
-            "detail": str(exc),
-            "parent_library": str(parent),
-        }
-        _write_json(cycle_dir / "cycle_result.json", value)
-        print(json.dumps(value, ensure_ascii=False, indent=2))
-        return 0
-    if decision.decision == "no_patch":
-        value = {
-            "status": "no_patch",
-            "decision": "no_patch",
-            "causal_summary": decision.causal_summary,
-            "parent_library": str(parent),
-        }
-        _write_json(cycle_dir / "cycle_result.json", value)
-        print(json.dumps(value, ensure_ascii=False, indent=2))
-        return 0
-    assert patch is not None
-    patch_path = cycle_dir / "candidate.patch.json"
-    _write_json(patch_path, patch.model_dump(mode="json"))
-    candidate = cycle_dir / "candidate_library"
-    apply_patch(parent, patch, candidate, library_id=f"{next_library_id}-candidate")
+        return value
 
-    source_seeds = sorted({
-        int(material[key]["identity"]["seed"])
-        for key in ("failure_run", "success_run")
-    })
-    replay_parent, replay_candidate = [], []
-    for seed in source_seeds:
-        for repeat in range(args.source_replay_repeats):
-            replay_repeat = 100 + repeat
-            replay_parent.append(_run_case(
-                args, phase="source_replay", role="parent", library=parent,
-                suite=args.suite, task=args.task, seed=seed, repeat=replay_repeat,
-                cycle_name=cycle_name,
-            ))
-            replay_candidate.append(_run_case(
-                args, phase="source_replay", role="candidate", library=candidate,
-                suite=args.suite, task=args.task, seed=seed, repeat=replay_repeat,
-                cycle_name=cycle_name,
-            ))
-    decision_value = _source_admission(
-        _traces_for(replay_parent), _traces_for(replay_candidate), patch.target_skill_id,
+    schedule = _proposal_schedule(
+        _csv_ints(args.discovery_seeds), args.max_proposal_rollouts,
     )
-    _write_json(cycle_dir / "admission.json", decision_value)
-    if decision_value["decision"] == "accepted":
+    for seed, repeat in schedule:
+        result = _run_case(
+            args, phase="proposal", role="parent", library=parent,
+            suite=args.suite, task=args.task, seed=seed, repeat=repeat,
+            cycle_name=cycle_name,
+        )
+        discovery.append(result)
+        if result.get("status") not in VALID_STATUSES:
+            continue
+        valid_rollouts += 1
+        evidence_bank = _evidence_for(discovery)
+        if evidence_bank:
+            _write_json(optimizer_dir / "evidence_bank.json", aggregate_evidence(evidence_bank))
+        traces = _traces_for(discovery)
+        focus_trace = load_recovery_trace(result["failure_recovery_trace"])
+        focus_run_id = str(focus_trace.get("identity", {}).get("run_id"))
+        material = select_recovery_material(
+            traces,
+            focus_run_id=focus_run_id,
+            attempted_material_ids=attempted_material_ids,
+            minimum_similarity=args.minimum_similarity,
+        )
+        if material is None:
+            continue
+
+        attempted_material_ids.add(material["material_id"])
+        optimizer_calls += 1
+        attempt_number = optimizer_calls
+        attempt_dir = optimizer_dir / f"attempt_{attempt_number:03d}"
+        _write_json(attempt_dir / "recovery_material.json", material)
+        summary = {
+            "attempt": attempt_number,
+            "material_id": material["material_id"],
+            "material_kind": material["kind"],
+            "latest_run_id": focus_run_id,
+            "target_skill_id": material["target_skill_id"],
+        }
+        print(
+            f"[skill-evolve] optimizer attempt {attempt_number}: "
+            f"{material['kind']} target={material['target_skill_id']} "
+            f"material={material['material_id']}", flush=True,
+        )
+        try:
+            optimizer_decision, patch = optimize_recovery(
+                material=material,
+                memory_dir=rendered_memory_dir(parent),
+                skill_path=args.optimizer_skill_path,
+                base_url=args.optimizer_base_url,
+                api_key=args.optimizer_api_key,
+                model=args.optimizer_model,
+                output_dir=attempt_dir,
+                max_tokens=args.optimizer_max_tokens,
+                timeout_s=args.optimizer_timeout_s,
+                enable_thinking=args.optimizer_enable_thinking,
+                model_source=args.optimizer_model_source,
+            )
+        except (OptimizerInfrastructureError, OptimizerProtocolError) as exc:
+            reason = (
+                "optimizer_infrastructure_error"
+                if isinstance(exc, OptimizerInfrastructureError)
+                else "optimizer_protocol_error"
+            )
+            summary.update({"optimizer_decision": "pending", "reason": reason, "detail": str(exc)})
+            attempt_summaries.append(summary)
+            _append_jsonl(cycle_dir / "optimizer_attempts.jsonl", summary)
+            return finish("pending", "pending", reason, detail=str(exc))
+        except (InvalidPatchError, ValueError) as exc:
+            summary.update({"optimizer_decision": "rejected", "reason": "invalid_patch", "detail": str(exc)})
+            attempt_summaries.append(summary)
+            _append_jsonl(cycle_dir / "optimizer_attempts.jsonl", summary)
+            continue
+
+        if optimizer_decision.decision == "no_patch":
+            summary.update({
+                "optimizer_decision": "no_patch",
+                "reason": "optimizer_no_patch",
+                "causal_summary": optimizer_decision.causal_summary,
+            })
+            attempt_summaries.append(summary)
+            _append_jsonl(cycle_dir / "optimizer_attempts.jsonl", summary)
+            continue
+
+        assert patch is not None
+        summary["causal_summary"] = optimizer_decision.causal_summary
+        candidate_root = cycle_dir / "candidates" / f"attempt_{attempt_number:03d}"
+        candidate = candidate_root / "library"
+        try:
+            _write_json(candidate_root / "candidate.patch.json", patch.model_dump(mode="json"))
+            apply_patch(
+                parent, patch, candidate,
+                library_id=f"{next_library_id}-candidate-a{attempt_number:03d}",
+            )
+        except (InvalidPatchError, ValueError) as exc:
+            summary.update({"optimizer_decision": "rejected", "reason": "invalid_patch", "detail": str(exc)})
+            attempt_summaries.append(summary)
+            _append_jsonl(cycle_dir / "optimizer_attempts.jsonl", summary)
+            continue
+
+        source_seeds = sorted({
+            int(material[key]["identity"]["seed"])
+            for key in ("failure_run", "success_run")
+        })
+        replay_parent, replay_candidate = [], []
+        replay_phase = f"source_replay_attempt_{attempt_number:03d}"
+        for source_seed in source_seeds:
+            for source_repeat in range(args.source_replay_repeats):
+                replay_repeat = 100 + source_repeat
+                replay_parent.append(_run_case(
+                    args, phase=replay_phase, role="parent", library=parent,
+                    suite=args.suite, task=args.task, seed=source_seed, repeat=replay_repeat,
+                    cycle_name=cycle_name,
+                ))
+                replay_candidate.append(_run_case(
+                    args, phase=replay_phase, role="candidate", library=candidate,
+                    suite=args.suite, task=args.task, seed=source_seed, repeat=replay_repeat,
+                    cycle_name=cycle_name,
+                ))
+        invalid_replays = [
+            item for item in (*replay_parent, *replay_candidate)
+            if item.get("status") not in VALID_STATUSES
+        ]
+        if invalid_replays:
+            summary.update({
+                "optimizer_decision": "patch",
+                "admission_result": "pending",
+                "reason": "source_replay_infrastructure_error",
+                "invalid_source_replays": len(invalid_replays),
+            })
+            attempt_summaries.append(summary)
+            _append_jsonl(cycle_dir / "optimizer_attempts.jsonl", summary)
+            return finish(
+                "pending", "pending", "source_replay_infrastructure_error",
+                invalid_source_replays=len(invalid_replays),
+            )
+        admission = _source_admission(
+            _traces_for(replay_parent), _traces_for(replay_candidate), patch.target_skill_id,
+        )
+        _write_json(attempt_dir / "admission.json", admission)
+        summary.update({
+            "optimizer_decision": "patch",
+            "admission_result": admission["decision"],
+            "reason": admission["reason"],
+            "candidate_library": str(candidate),
+        })
+        attempt_summaries.append(summary)
+        _append_jsonl(cycle_dir / "optimizer_attempts.jsonl", summary)
+        if admission["decision"] != "accepted":
+            continue
+
         admitted = libraries / next_library_id
         apply_patch(parent, patch, admitted, library_id=next_library_id)
-        decision_value["admitted_library"] = str(admitted)
-    decision_value.update(
-        {
-            "status": decision_value["decision"],
-            "parent_library": str(parent),
-            "candidate_library": str(candidate),
-            "target_skill_id": patch.target_skill_id,
-        }
+        return finish(
+            "accepted", "accepted", "skill_published",
+            admitted_library=str(admitted), candidate_library=str(candidate),
+            target_skill_id=patch.target_skill_id, admission=admission,
+        )
+
+    return finish(
+        "no_patch", "no_patch", "proposal_budget_exhausted",
+        reason="no candidate was admitted before the proposal budget was exhausted",
     )
-    _write_json(cycle_dir / "cycle_result.json", decision_value)
-    print(json.dumps(decision_value, ensure_ascii=False, indent=2))
-    return 0
+
+
+def main() -> int:
+    args = _parser().parse_args()
+    args.repo_root = args.repo_root.resolve()
+    args.libero_root = args.libero_root.resolve()
+    args.experiment_dir = args.experiment_dir.resolve()
+    if args.max_proposal_rollouts < 1 or args.max_evolution_cycles < 1:
+        raise ValueError("proposal rollout and evolution cycle limits must be positive")
+    if args.planner_model_source == "remote":
+        if not args.qwen_base_url.startswith("https://") or args.qwen_api_key in {"", "EMPTY"}:
+            raise ValueError("remote planner requires an HTTPS base URL and RPENT_PLANNER_API_KEY")
+        if "qwen3.7-max" in args.model.lower() and not args.planner_enable_thinking:
+            raise ValueError("remote Qwen3.7-Max planner requires --planner-enable-thinking")
+    if args.optimizer_model_source == "remote":
+        if not args.optimizer_base_url.startswith("https://") or args.optimizer_api_key in {"", "EMPTY"}:
+            raise ValueError("remote optimizer requires an HTTPS base URL and RPENT_OPTIMIZER_API_KEY")
+        if "qwen3.7-max" in args.optimizer_model.lower() and not args.optimizer_enable_thinking:
+            raise ValueError("remote Qwen3.7-Max optimizer requires --optimizer-enable-thinking")
+    args.experiment_dir.mkdir(parents=True, exist_ok=True)
+    runtime_libero_root = _prepare_libero(args)
+    libraries = args.experiment_dir / "libraries"
+    initial = libraries / "S000"
+    if not initial.exists():
+        print("[skill-evolve] snapshot exact baseline MEMORY -> S000", flush=True)
+        create_snapshot(args.memory_dir, initial, library_id="S000")
+
+    cycles = []
+    exit_code = 0
+    for _ in range(args.max_evolution_cycles):
+        result = _run_evolution_cycle(
+            args, runtime_libero_root=runtime_libero_root, libraries=libraries,
+        )
+        cycles.append(result)
+        if result["status"] == "accepted":
+            continue
+        if result["status"] == "pending":
+            exit_code = 2
+        break
+    accepted = sum(item["status"] == "accepted" for item in cycles)
+    summary = {
+        "schema_version": "SkillEvolutionRunResult/v1",
+        "status": "pending" if exit_code else "completed",
+        "cycles_run": len(cycles),
+        "successful_evolutions": accepted,
+        "max_evolution_cycles": args.max_evolution_cycles,
+        "stop_reason": (
+            cycles[-1]["stop_reason"]
+            if cycles and cycles[-1]["status"] != "accepted"
+            else "max_evolution_cycles_reached"
+        ),
+        "cycles": cycles,
+    }
+    _write_json(args.experiment_dir / "evolution_run_result.json", summary)
+    return exit_code
 
 
 if __name__ == "__main__":

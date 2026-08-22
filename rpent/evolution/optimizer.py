@@ -6,8 +6,10 @@ import base64
 import json
 import mimetypes
 import re
+import struct
 import urllib.error
 import urllib.request
+import zlib
 from pathlib import Path
 from typing import Any
 
@@ -75,6 +77,29 @@ def _post_json(url: str, key: str, body: dict[str, Any], timeout_s: int) -> dict
 def _data_url(path: Path) -> str:
     mime = mimetypes.guess_type(path.name)[0] or "image/png"
     return f"data:{mime};base64,{base64.b64encode(path.read_bytes()).decode()}"
+
+
+def _solid_png_data_url(size: int = 16) -> str:
+    """Build a dependency-free RGB PNG large enough for hosted VLM limits."""
+    if size <= 10:
+        raise ValueError("VLM probe image dimensions must be greater than 10")
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        payload = kind + data
+        return (
+            struct.pack(">I", len(data))
+            + payload
+            + struct.pack(">I", zlib.crc32(payload) & 0xFFFFFFFF)
+        )
+
+    row = b"\x00" + (b"\xff\x00\x00" * size)
+    png = (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(row * size))
+        + chunk(b"IEND", b"")
+    )
+    return "data:image/png;base64," + base64.b64encode(png).decode("ascii")
 
 
 def _source_files(memory_dir: Path, evidence: list[dict[str, Any]]) -> dict[str, str]:
@@ -321,13 +346,12 @@ def check_optimizer_service(
             json.loads(response.read())
     except Exception as exc:
         raise OptimizerInfrastructureError(f"optimizer models endpoint failed: {exc}") from exc
-    # One-pixel PNG; validates image input and JSON output without tool calling.
-    red = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Z9WQAAAAASUVORK5CYII="
+    # Hosted Qwen rejects images with either dimension <= 10.
     body = {
         "model": model,
         "messages": [{"role": "user", "content": [
             {"type": "text", "text": "Return exactly one JSON object with key status and value ready."},
-            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{red}"}},
+            {"type": "image_url", "image_url": {"url": _solid_png_data_url()}},
         ]}],
         "temperature": 0,
         "max_tokens": 1024 if enable_thinking else 128,
