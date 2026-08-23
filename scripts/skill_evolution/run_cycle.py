@@ -373,14 +373,28 @@ def _source_admission(parent: list[dict[str, Any]], candidate: list[dict[str, An
     elif c["successes"] < p["successes"]:
         accepted, reason = False, "fewer_source_successes"
     else:
-        p_cost = (p["failure_anchors"], p["recovery_actions"], p["turns"])
-        c_cost = (c["failure_anchors"], c["recovery_actions"], c["turns"])
-        accepted = c_cost < p_cost
-        reason = "equal_success_lower_recovery_cost" if accepted else "no_strict_source_improvement"
+        turn_tolerance = max(2 * len(c["runs"]), int(0.10 * max(1, p["turns"])))
+        non_regressive = (
+            c["failure_anchors"] <= p["failure_anchors"]
+            and c["recovery_actions"] <= p["recovery_actions"]
+            and c["turns"] <= p["turns"] + turn_tolerance
+        )
+        strict_recovery_improvement = non_regressive and (
+            c["failure_anchors"] < p["failure_anchors"]
+            or c["recovery_actions"] < p["recovery_actions"]
+        )
+        accepted = non_regressive
+        if strict_recovery_improvement:
+            reason = "equal_success_lower_recovery_cost"
+        elif non_regressive:
+            reason = "equal_success_non_regressive"
+        else:
+            reason = "equal_success_recovery_regression"
     return {
         "schema_version": "SourceReplayAdmission/v1",
         "decision": "accepted" if accepted else "rejected", "reason": reason,
         "source_success_regression_indices": regressions,
+        "admission_policy": "no_success_regression_and_non_regressive_recovery",
         "parent": p, "candidate": c,
     }
 

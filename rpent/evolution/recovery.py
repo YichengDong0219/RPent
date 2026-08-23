@@ -40,6 +40,48 @@ def _last_skill_before(evidence: dict[str, Any], event_id: int | None) -> str | 
     return str(valid[-1]["skill_id"]) if valid else None
 
 
+def _preferred_skill(action: dict[str, Any], fallback: str | None = None) -> str | None:
+    """Prefer the first skill active on the behavior over read-order recency."""
+    active = [str(item) for item in action.get("active_skill_ids", []) if item]
+    return active[0] if active else fallback
+
+
+def _diagnostic_facts(action: dict[str, Any]) -> dict[str, Any]:
+    """Compute threshold semantics in code so the VLM need not compare floats."""
+    diagnostics = action.get("diagnostics", {})
+    arguments = action.get("arguments", {})
+    peak_lift = diagnostics.get("peak_lift_m")
+    lift_threshold = arguments.get("lift_thresh", 0.05 if action.get("tool") == "pi0_pick" else None)
+    opening = diagnostics.get("min_gripper_opening")
+    closed_threshold = arguments.get("gripper_closed_thresh")
+    chunks, max_chunks = diagnostics.get("chunks_used"), diagnostics.get("max_chunks")
+    steps, max_steps = diagnostics.get("steps_used"), diagnostics.get("max_steps")
+    return {
+        "primitive_reported_success": diagnostics.get("success"),
+        "lift_condition_met": (
+            peak_lift >= lift_threshold
+            if isinstance(peak_lift, (int, float)) and isinstance(lift_threshold, (int, float))
+            else None
+        ),
+        "gripper_condition_met": (
+            opening < closed_threshold
+            if isinstance(opening, (int, float)) and isinstance(closed_threshold, (int, float))
+            else None
+        ),
+        "chunk_budget_exhausted": (
+            chunks >= max_chunks
+            if isinstance(chunks, (int, float)) and isinstance(max_chunks, (int, float))
+            else None
+        ),
+        "step_budget_exhausted": (
+            steps >= max_steps
+            if isinstance(steps, (int, float)) and isinstance(max_steps, (int, float))
+            else None
+        ),
+        "action_triggered_termination": bool(diagnostics.get("libero_terminated")),
+    }
+
+
 def classify_failure(action: dict[str, Any]) -> dict[str, Any] | None:
     """Return an observable failure anchor, never an inferred causal diagnosis."""
     diagnostics = action.get("diagnostics", {})
@@ -64,25 +106,64 @@ def classify_failure(action: dict[str, Any]) -> dict[str, Any] | None:
 def _is_diagnostic_mismatch(
     action: dict[str, Any], following: list[dict[str, Any]], benchmark_success: bool,
 ) -> bool:
-    """Recognize a false-negative pick only with a successful normal suffix."""
+    """Recognize a false-negative pick from code-derived conditions and success."""
     diagnostics = action.get("diagnostics", {})
-    peak_lift = diagnostics.get("peak_lift_m")
-    lift_threshold = (action.get("arguments") or {}).get("lift_thresh", 0.05)
-    tools = [item.get("tool") for item in following]
-    normal_suffix = (
-        any(tool in {"move_to", "move_pose"} for tool in tools)
-        and "release" in tools
-        and not any(tool in {"pi0_pick", "pi0_doubled", "set_gripper"} for tool in tools)
+    facts = _diagnostic_facts(action)
+    later_terminal = any(
+        item.get("diagnostics", {}).get("libero_terminated") for item in following
     )
     return bool(
         benchmark_success
         and action.get("tool") == "pi0_pick"
         and diagnostics.get("success") is False
-        and isinstance(peak_lift, (int, float))
-        and isinstance(lift_threshold, (int, float))
-        and peak_lift >= lift_threshold
-        and normal_suffix
+        and facts["lift_condition_met"] is True
+        and facts["gripper_condition_met"] is True
+        and later_terminal
     )
+
+
+def _nonterminal_release_failure(
+    action: dict[str, Any], preceding: list[dict[str, Any]],
+    following: list[dict[str, Any]], benchmark_success: bool,
+) -> dict[str, str] | None:
+    if action.get("tool") != "release" or action.get("diagnostics", {}).get("libero_terminated"):
+        return None
+    previous_pick = next(
+        (item for item in reversed(preceding) if item.get("tool") in {"pi0_pick", "pi0_doubled"}),
+        None,
+    )
+    next_pick = next(
+        (item for item in following if item.get("tool") in {"pi0_pick", "pi0_doubled"}),
+        None,
+    )
+    stop = {
+        "pick", "picked", "up", "grab", "grasp", "put", "place", "into", "in",
+        "the", "a", "an", "and", "basket", "can", "box", "object",
+    }
+
+    def object_tokens(item: dict[str, Any] | None) -> set[str]:
+        if not item:
+            return set()
+        args = item.get("arguments", {})
+        text = str(args.get("prompt") or args.get("instruction") or "").lower()
+        return {token for token in re.findall(r"[a-z][a-z0-9_]+", text) if token not in stop}
+
+    same_object_retry = bool(object_tokens(previous_pick) & object_tokens(next_pick))
+    immediate_manual_retry = any(
+        item.get("tool") == "set_gripper" for item in following[:2]
+    )
+    if not same_object_retry and not immediate_manual_retry:
+        return None
+    terminal_later = any(
+        item.get("diagnostics", {}).get("libero_terminated") for item in following
+    )
+    return {
+        "kind": "nonterminal_release",
+        "observable": (
+            "release did not trigger libero_terminated; a later recovery was attempted"
+            + (" and reached benchmark success" if benchmark_success and terminal_later else "")
+        ),
+    }
 
 
 def build_recovery_trace(evidence: dict[str, Any], output_path: str | Path) -> dict[str, Any]:
@@ -91,12 +172,18 @@ def build_recovery_trace(evidence: dict[str, Any], output_path: str | Path) -> d
     benchmark_success = bool(evidence.get("outcome", {}).get("benchmark_success"))
     anchors = []
     for index, action in enumerate(actions):
+        full_following = actions[index + 1:]
         failure = classify_failure(action)
         if not failure:
+            failure = _nonterminal_release_failure(
+                action, actions[:index], full_following, benchmark_success,
+            )
+        if not failure:
             continue
-        target = _last_skill_before(evidence, action.get("call_event_id"))
-        full_following = actions[index + 1:]
-        following = full_following[:6]
+        target = _preferred_skill(
+            action, _last_skill_before(evidence, action.get("call_event_id")),
+        )
+        following = full_following[:10]
         if _is_diagnostic_mismatch(action, full_following, benchmark_success):
             peak_lift = action["diagnostics"]["peak_lift_m"]
             lift_threshold = action.get("arguments", {}).get("lift_thresh", 0.05)
@@ -104,7 +191,7 @@ def build_recovery_trace(evidence: dict[str, Any], output_path: str | Path) -> d
                 "kind": "diagnostic_mismatch",
                 "observable": (
                     f"success=false but peak_lift_m={peak_lift} "
-                    f">= lift_thresh={lift_threshold}; normal carry/release reached benchmark success"
+                    f">= lift_thresh={lift_threshold}; a later action reached benchmark success"
                 ),
             }
         anchors.append(
@@ -113,8 +200,12 @@ def build_recovery_trace(evidence: dict[str, Any], output_path: str | Path) -> d
                 "target_skill_id": target,
                 "failure": failure,
                 "failed_action": action,
+                "diagnostic_facts": _diagnostic_facts(action),
                 "prefix": actions[max(0, index - 3):index],
                 "following_actions": following,
+                "terminal_recovery_observed": any(
+                    item.get("diagnostics", {}).get("libero_terminated") for item in full_following
+                ),
             }
         )
     if (
@@ -124,7 +215,9 @@ def build_recovery_trace(evidence: dict[str, Any], output_path: str | Path) -> d
     ):
         index = len(actions) - 1
         action = actions[index]
-        target = _last_skill_before(evidence, action.get("call_event_id"))
+        target = _preferred_skill(
+            action, _last_skill_before(evidence, action.get("call_event_id")),
+        )
         anchors.append(
             {
                 "action_index": index,
@@ -134,8 +227,10 @@ def build_recovery_trace(evidence: dict[str, Any], output_path: str | Path) -> d
                     "observable": "episode ended without libero_terminated",
                 },
                 "failed_action": action,
+                "diagnostic_facts": _diagnostic_facts(action),
                 "prefix": actions[max(0, index - 3):index],
                 "following_actions": [],
+                "terminal_recovery_observed": False,
             }
         )
     valid = bool(evidence.get("outcome", {}).get("valid_benchmark_outcome"))
@@ -200,15 +295,37 @@ def _action_score(left: dict[str, Any], right: dict[str, Any]) -> float:
     return 0.5 * tool + 0.3 * lexical + 0.2 * _state_score(left, right)
 
 
-def _prefix_similarity(anchor: dict[str, Any], success_actions: list[dict[str, Any]]) -> float:
+def _prefix_similarity(
+    anchor: dict[str, Any], success_actions: list[dict[str, Any]], success_index: int,
+) -> float:
     """Score behavior/state before divergence; do not reward the divergent action."""
-    index = int(anchor["action_index"])
     failed_prefix = anchor.get("prefix", [])
-    success_prefix = success_actions[max(0, index - len(failed_prefix)):index]
+    success_prefix = success_actions[max(0, success_index - len(failed_prefix)):success_index]
     pairs = list(zip(failed_prefix[-len(success_prefix):], success_prefix))
     behavior = sum(_action_score(left, right) for left, right in pairs) / len(pairs) if pairs else None
-    state = _state_score(anchor["failed_action"], success_actions[index])
+    state = _state_score(anchor["failed_action"], success_actions[success_index])
     return state if behavior is None else 0.65 * behavior + 0.35 * state
+
+
+def _best_success_divergence(
+    anchor: dict[str, Any], success_actions: list[dict[str, Any]],
+) -> tuple[float, int, dict[str, Any], bool] | None:
+    candidates = []
+    failed_action = anchor["failed_action"]
+    for index, action in enumerate(success_actions):
+        score = _prefix_similarity(anchor, success_actions, index)
+        prefix_coverage = min(len(anchor.get("prefix", [])), index)
+        same_action = (
+            failed_action.get("tool"), failed_action.get("arguments")
+        ) == (action.get("tool"), action.get("arguments"))
+        candidates.append((score, index, action, same_action, prefix_coverage))
+    if not candidates:
+        return None
+    score, index, action, same_action, _ = max(
+        candidates,
+        key=lambda item: (item[0], item[4], -abs(item[1] - int(anchor["action_index"]))),
+    )
+    return score, index, action, same_action
 
 
 def _run_id(trace: dict[str, Any]) -> str:
@@ -223,6 +340,7 @@ def _with_material_id(material: dict[str, Any]) -> dict[str, Any]:
         "failure_run_id": _run_id(material["failure_run"]),
         "success_run_id": _run_id(material["success_run"]),
         "failure_event_id": anchor.get("failed_action", {}).get("call_event_id"),
+        "success_event_id": material.get("successful_next_action", {}).get("call_event_id"),
     }
     digest = hashlib.sha256(
         json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
@@ -259,7 +377,9 @@ def select_recovery_material(
             following = anchor.get("following_actions", [])
             if not target or not following:
                 continue
-            diagnostic = anchor.get("failure", {}).get("kind") == "diagnostic_mismatch"
+            failure_kind = anchor.get("failure", {}).get("kind")
+            diagnostic = failure_kind == "diagnostic_mismatch"
+            target = _preferred_skill(following[0], target)
             material = _with_material_id({
                 "schema_version": "RecoveryMaterial/v1",
                 "kind": "diagnostic_mismatch" if diagnostic else "self_recovery",
@@ -269,12 +389,17 @@ def select_recovery_material(
                 "success_run": focus,
                 "anchor": anchor,
                 "successful_next_action": following[0],
+                "successful_suffix": following,
                 "latest_run_id": _run_id(focus),
+                "ownership_basis": "first_recovery_action",
             })
             if material["material_id"] not in attempted:
-                # Explicit physical self-recovery outranks all contrasts;
-                # diagnostic mismatches remain eligible at lowest priority.
-                candidates.append(((1 if diagnostic else 4, 1, 1.0), material))
+                priority = 5 if failure_kind == "nonterminal_release" else 1 if diagnostic else 4
+                candidates.append(((
+                    priority,
+                    int(bool(anchor.get("terminal_recovery_observed"))),
+                    float(anchor.get("action_index", 0)),
+                ), material))
 
     failures = [item for item in valid if not item.get("outcome", {}).get("benchmark_success")]
     successes = [item for item in valid if item.get("outcome", {}).get("benchmark_success")]
@@ -283,25 +408,30 @@ def select_recovery_material(
             target = anchor.get("target_skill_id")
             if not target:
                 continue
-            index = int(anchor["action_index"])
             for success in successes:
                 if (focus is not failed and focus is not success) or failed is success:
                     continue
-                active = {x for action in success.get("actions", []) for x in action.get("active_skill_ids", [])}
-                if target not in active or index >= len(success.get("actions", [])):
+                match = _best_success_divergence(anchor, success.get("actions", []))
+                if match is None:
                     continue
-                left, right = anchor["failed_action"], success["actions"][index]
-                score = _prefix_similarity(anchor, success["actions"])
-                if score < minimum_similarity:
-                    continue
-                if (left.get("tool"), left.get("arguments")) == (right.get("tool"), right.get("arguments")):
-                    continue
+                score, success_index, right, same_action = match
                 same_seed = failed.get("identity", {}).get("seed") == success.get("identity", {}).get("seed")
+                threshold = max(0.45, minimum_similarity - 0.10) if same_seed else minimum_similarity
+                if score < threshold:
+                    continue
+                material_target = _preferred_skill(right, target)
+                if not material_target:
+                    continue
+                successful_suffix = success.get("actions", [])[success_index:success_index + 6]
                 material = _with_material_id({
                     "schema_version": "RecoveryMaterial/v1", "kind": "contrast",
-                    "target_skill_id": target, "similarity": round(score, 4),
+                    "target_skill_id": material_target, "similarity": round(score, 4),
                     "same_seed": same_seed, "failure_run": failed, "success_run": success,
                     "anchor": anchor, "successful_next_action": right,
+                    "successful_suffix": successful_suffix,
+                    "successful_action_index": success_index,
+                    "same_divergence_action": same_action,
+                    "ownership_basis": "matched_success_action",
                     "latest_run_id": _run_id(focus),
                 })
                 if material["material_id"] not in attempted:

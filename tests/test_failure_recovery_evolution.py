@@ -63,9 +63,13 @@ def test_self_recovery_is_preferred(tmp_path):
 def test_diagnostic_false_negative_is_not_physical_recovery(tmp_path):
     pick = _action("pi0_pick", 3, success=False)
     pick["arguments"]["lift_thresh"] = 0.05
+    pick["arguments"]["gripper_closed_thresh"] = 0.06
     pick["diagnostics"]["peak_lift_m"] = 0.08
+    pick["diagnostics"]["min_gripper_opening"] = 0.04
+    release = _action("release", 7)
+    release["diagnostics"]["libero_terminated"] = True
     trace = build_recovery_trace(
-        _evidence("false-negative", True, [pick, _action("move_to", 5), _action("release", 7)]),
+        _evidence("false-negative", True, [pick, _action("move_to", 5), release]),
         tmp_path / "trace.jsonl",
     )
     assert trace["failure_anchors"][0]["failure"]["kind"] == "diagnostic_mismatch"
@@ -83,6 +87,56 @@ def test_contrast_matches_prefix_state_before_a_different_next_tool(tmp_path):
     material = select_recovery_material([failed, succeeded], minimum_similarity=0.65)
     assert material is not None
     assert material["kind"] == "contrast"
+    assert material["successful_next_action"]["tool"] == "pi0_doubled"
+
+
+def test_nonterminal_release_becomes_high_quality_recovery_anchor(tmp_path):
+    initial_pick = _action("pi0_pick", 3, success=True)
+    initial_pick["arguments"]["instruction"] = "pick up alphabet soup"
+    release = _action("release", 5)
+    retry = _action("pi0_pick", 7, success=True)
+    retry["arguments"]["instruction"] = "re-pick alphabet soup"
+    retry["active_skill_ids"] = ["winning_skill", "demo"]
+    retry["diagnostics"]["libero_terminated"] = True
+    trace = build_recovery_trace(
+        _evidence("recovered-placement", True, [initial_pick, release, retry]),
+        tmp_path / "release.jsonl",
+    )
+    material = select_recovery_material([trace])
+    assert material is not None
+    assert material["anchor"]["failure"]["kind"] == "nonterminal_release"
+    assert material["anchor"]["terminal_recovery_observed"] is True
+    assert material["successful_next_action"]["tool"] == "pi0_pick"
+    assert material["target_skill_id"] == "winning_skill"
+
+
+def test_normal_first_release_in_multi_object_task_is_not_a_failure(tmp_path):
+    first = _action("pi0_pick", 3, success=True)
+    first["arguments"]["instruction"] = "pick up alphabet soup"
+    second = _action("pi0_pick", 7, success=True)
+    second["arguments"]["instruction"] = "pick up butter"
+    trace = build_recovery_trace(
+        _evidence("two-objects", True, [first, _action("release", 5), second]),
+        tmp_path / "multi.jsonl",
+    )
+    assert all(
+        anchor["failure"]["kind"] != "nonterminal_release"
+        for anchor in trace["failure_anchors"]
+    )
+
+
+def test_contrast_aligns_local_subtask_when_absolute_indices_differ(tmp_path):
+    failed_actions = [_action("move_to", 3 + 2 * index, x=0.4) for index in range(7)]
+    failed_actions.append(_action("pi0_pick", 17, success=False, x=0.0))
+    success_actions = [_action("move_to", 31, x=0.4), _action("pi0_doubled", 33, success=True, x=0.0)]
+    failed = build_recovery_trace(_evidence("long-failure", False, failed_actions), tmp_path / "lf.jsonl")
+    succeeded = build_recovery_trace(_evidence("short-success", True, success_actions), tmp_path / "ss.jsonl")
+    material = select_recovery_material(
+        [failed, succeeded], focus_run_id="short-success", minimum_similarity=0.55,
+    )
+    assert material is not None
+    assert material["kind"] == "contrast"
+    assert material["successful_action_index"] == 1
     assert material["successful_next_action"]["tool"] == "pi0_doubled"
 
 

@@ -15,6 +15,32 @@ def test_proposal_schedule_is_seed_round_robin_with_per_seed_repeats():
     ]
 
 
+def test_equal_success_non_regressive_source_replay_is_admitted():
+    trace = {
+        "outcome": {"benchmark_success": True},
+        "failure_anchors": [],
+        "actions": [{"active_skill_ids": ["demo"]}],
+        "cost": {"turns": 5},
+    }
+    result = cycle._source_admission([trace], [trace], "demo")
+    assert result["decision"] == "accepted"
+    assert result["reason"] == "equal_success_non_regressive"
+
+
+def test_source_success_regression_remains_rejected():
+    parent = {
+        "outcome": {"benchmark_success": True}, "failure_anchors": [],
+        "actions": [{"active_skill_ids": ["demo"]}], "cost": {"turns": 5},
+    }
+    candidate = {
+        "outcome": {"benchmark_success": False}, "failure_anchors": [],
+        "actions": [{"active_skill_ids": ["demo"]}], "cost": {"turns": 4},
+    }
+    result = cycle._source_admission([parent], [candidate], "demo")
+    assert result["decision"] == "rejected"
+    assert result["reason"] == "source_success_regression"
+
+
 def test_no_patch_and_rejected_admission_continue_until_publish(tmp_path, monkeypatch):
     memory = tmp_path / "memory"
     memory.mkdir()

@@ -8,7 +8,7 @@ set -Eeuo pipefail
 # =============================================================================
 # Quick configuration
 # =============================================================================
-EXPERIMENT_NAME="libero_object_t0_failure_recovery_evolve_v1"
+EXPERIMENT_NAME="libero_object_t0_failure_recovery_evolve_v2"
 # Base LIBERO checkout. Standard suites use its assets directly. PRO suites
 # use the installed liberopro assets selected by LIBERO_TYPE while retaining
 # this checkout for the shared LIBERO import surface.
@@ -27,7 +27,7 @@ MAX_PROPOSAL_ROLLOUTS=6
 # Only an admitted and published skill advances a cycle. A budget-exhausted
 # cycle stops the task; successful cycles advance automatically up to this cap.
 MAX_EVOLUTION_CYCLES=3
-MINIMUM_SIMILARITY=0.65
+MINIMUM_SIMILARITY=0.55
 # Only replay the source seed(s), as requested for this first version.
 SOURCE_REPLAY_REPEATS=2
 
@@ -66,7 +66,7 @@ SKILL_OPTIMIZER_SKILL_PATH="scripts/skill_evolution/recovery_optimizer/SKILL.md"
 
 # Pi0.5: same checkpoint, endpoint and unrestricted baseline tool schema.
 PI05_CHECKPOINT="/home/dongyicheng/checkpoints/RLinf-Pi05-LIBERO-130-fullshot-SFT"
-VLA_GPU="3"
+VLA_GPU="2"
 START_SHARED_VLA=1
 VLA_ENDPOINT="http://127.0.0.1:18081"
 VLA_HOST="127.0.0.1"

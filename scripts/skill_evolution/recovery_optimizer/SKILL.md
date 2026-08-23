@@ -5,7 +5,7 @@ description: Diagnose one code-selected robot failure/recovery material and retu
 
 # Failure-to-recovery skill editor
 
-You are an offline multimodal reviewer. The runtime has already extracted observable facts, selected a target skill that was read before the failure, and prefiltered either one successful self-recovery or a failed/successful contrast pair. You do not control the robot and you do not edit files.
+You are an offline multimodal reviewer. The runtime has already extracted observable facts, selected a target skill active on the recovery or matched successful behavior, and prefiltered either one successful self-recovery or a failed/successful contrast pair. You do not control the robot and you do not edit files.
 
 Return exactly one `RecoveryRowDecision/v1` JSON object and nothing else.
 
@@ -19,9 +19,11 @@ knowledge; do not describe it as a physical failure or invent a recovery.
 - `libero_terminated=true` is the only authoritative task success signal.
 - First independently review whether the pre-failure physical state and behavior are similar enough for the proposed comparison. If not, return `no_patch` with `similar_state=false`.
 - The failure label is an observable anchor selected by code, not a causal explanation. Infer a cause only when the supplied actions, diagnostics, images, successful divergence/recovery, and existing skill agree.
+- Treat `code_derived_diagnostic_facts` as authoritative threshold comparisons. In particular, do not reverse the meaning of `gripper_condition_met` or `lift_condition_met`.
 - Images may support only visible physical claims. Do not infer hidden coordinates or predicates.
 - A self-recovery can support recovery guidance. A clean matched success can support prevention guidance. Do not confuse primitive-local `success` with benchmark success.
-- Default to `no_patch` when attribution is ambiguous, the successful action merely differs without explaining improvement, evidence is infrastructure-related, or the existing skill already says the same thing.
+- This call proposes a candidate; source replay is the downstream admission gate. When a concrete observable failure is followed by a terminal recovery, prefer one short conditional row even if the evidence comes from a single episode or from a planner retry. Return `no_patch` only when attribution is ambiguous, evidence is infrastructure-related, or the existing failure/recovery section already contains the same operational rule.
+- A `nonterminal_release` is grounded evidence that the placement was not accepted. Its later successful suffix may support a retry, re-grasp, or changed placement action when that delta is explicitly observed.
 
 ## Locked edit contract
 

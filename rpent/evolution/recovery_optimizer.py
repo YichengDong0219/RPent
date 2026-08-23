@@ -42,7 +42,7 @@ def _editable_excerpt(source: str, limit: int = 9000) -> str:
     section = _failure_section(source)
     if section is None:
         return source[:limit]
-    front = "\n".join(source.splitlines()[:12])
+    front = "\n".join(source.splitlines()[:36])
     return (front + "\n\n" + section[0])[:limit]
 
 
@@ -63,14 +63,20 @@ def compact_material(material: dict[str, Any]) -> dict[str, Any]:
         "kind": material["kind"], "target_skill_id": material["target_skill_id"],
         "structured_similarity": material.get("similarity"),
         "same_seed": material.get("same_seed"),
+        "ownership_basis": material.get("ownership_basis"),
+        "successful_action_index": material.get("successful_action_index"),
+        "same_divergence_action": material.get("same_divergence_action"),
         "task_language": failure.get("identity", {}).get("task_language"),
         "failure_run_id": failure.get("identity", {}).get("run_id"),
         "success_run_id": success.get("identity", {}).get("run_id"),
         "failure_observation": anchor.get("failure"),
+        "code_derived_diagnostic_facts": anchor.get("diagnostic_facts", {}),
+        "terminal_recovery_observed": anchor.get("terminal_recovery_observed", False),
         "pre_failure_actions": [_slim_action(x) for x in anchor.get("prefix", [])],
         "failed_action": _slim_action(anchor["failed_action"]),
         "successful_next_action": _slim_action(material["successful_next_action"]),
         "observed_recovery_actions": [_slim_action(x) for x in anchor.get("following_actions", [])],
+        "successful_suffix": [_slim_action(x) for x in material.get("successful_suffix", [])],
         "failure_outcome": failure.get("outcome", {}),
         "success_outcome": success.get("outcome", {}),
     }
